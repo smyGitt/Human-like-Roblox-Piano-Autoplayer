@@ -1,1211 +1,1133 @@
 #!/usr/bin/env python3
-"""
-MIDI-to-Keyboard Player - Fully Humanized Version with Note Overlap Fix
-Maps MIDI notes to computer keyboard keys with comprehensive human-like playing simulation.
-Includes spacebar pedal control and extensive debug capabilities.
-FIXED: Note overlap handling to prevent silent notes in external applications.
-"""
-
-import argparse
+#
+# MIDI2Key: A robust MIDI performance engine with a user-friendly GUI.
+# Final version incorporating functional logic and all requested features.
+#
 import mido
 import time
-import threading
-import sys
 import heapq
-import signal
+import threading
 import random
-import math
-from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple, Optional
-from pynput.keyboard import Key, Controller
+import copy
+import numpy as np
+import sys
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Set
+from collections import defaultdict
+import os
+import sys
+from PyQt6.QtGui import QIcon
+
+# --- GUI Dependencies ---
+try:
+    from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                                 QPushButton, QCheckBox, QSlider, QLabel, QFileDialog,
+                                 QGroupBox, QFormLayout, QTabWidget, QTextEdit, QProgressBar,
+                                 QComboBox, QDoubleSpinBox, QMessageBox, QSpinBox, QGridLayout)
+    from PyQt6.QtCore import QObject, QThread, pyqtSignal as Signal, Qt
+    from PyQt6.QtGui import QFont
+except ImportError:
+    print("PyQt6 not found. Please run 'pip install PyQt6' to run the GUI.")
+    sys.exit(1)
+
+# --- Engine Dependencies ---
+try:
+    from sklearn.cluster import KMeans
+except ImportError:
+    print("Scikit-learn not found. Please run 'pip install scikit-learn' for advanced pedal analysis.")
+    sys.exit(1)
+
+try:
+    from pynput.keyboard import Key, Controller
+except ImportError:
+    print("pynput not found. Please run 'pip install pynput'.")
+    sys.exit(1)
+
+
+# =====================================================================================
+# ==                                                                                 ==
+# ==                       SECTION 1: CORE ENGINE & DATA STRUCTURES                  ==
+# ==                                                                                 ==
+# =====================================================================================
 
 @dataclass
-class NoteEvent:
-    """MIDI note event with comprehensive timing and musical analysis data."""
-    midi_note: int                    # MIDI note number (0-127)
-    start_time: float                 # Note start time in seconds
-    duration: float                   # Note duration in seconds
-    velocity: int                     # MIDI velocity (1-127)
-    original_velocity: int = None     # Unmodified velocity for reference
-    is_melody: bool = False           # True if this note is part of main melody line
-    chord_position: int = 0           # Position within chord (0=lowest, etc.)
-    beat_strength: float = 1.0        # Rhythmic emphasis factor (0.5-1.5)
-    phrase_position: str = "middle"   # Position in musical phrase: start/middle/end
-    
-    def __post_init__(self):
-        """Initialize derived values after creation."""
-        if self.original_velocity is None:
-            self.original_velocity = self.velocity
-    
+class Note:
+    """Represents a single, parsed musical note."""
+    id: int # Unique ID for tracking
+    pitch: int
+    velocity: int
+    start_time: float
+    duration: float
+    hand: str = 'unknown'
+
+@dataclass(order=True)
+class KeyEvent:
+    """Represents a scheduled keyboard event for the priority queue."""
+    time: float
+    priority: int = field(compare=True)
+    action: str = field(compare=False)
+    key_char: str = field(compare=False)
+
+@dataclass
+class RhythmicPhrase:
+    """Represents a sub-section with a consistent rhythmic and melodic character."""
+    start_time: float
+    end_time: float
+    notes: List[Note]
+    articulation_label: str
+    pattern_label: str = 'standard'
+
+@dataclass
+class MusicalSection:
+    """Represents a major musical phrase, which contains smaller rhythmic phrases."""
+    start_time: float
+    end_time: float
+    note_count: int
+    notes: List[Note]
+    normalized_density: float
+    pace_label: str = 'unclassified'
+    rhythmic_phrases: List[RhythmicPhrase] = field(default_factory=list)
+    is_bridge: bool = False
+
     @property
-    def end_time(self) -> float:
-        """Calculate note end time from start + duration."""
-        return self.start_time + self.duration
+    def duration(self) -> float:
+        return self.end_time - self.start_time
 
 @dataclass
-class ChordGroup:
-    """Group of notes played simultaneously with musical analysis."""
-    start_time: float                 # When chord starts playing
-    left_hand_notes: List[NoteEvent]  # Notes assigned to left hand
-    right_hand_notes: List[NoteEvent] # Notes assigned to right hand
-    beat_position: float = 0.0        # Position within measure (0.0-1.0)
-    is_strong_beat: bool = False      # True if on downbeat or strong beat
-    chord_complexity: float = 1.0     # Difficulty factor (0.0-1.0)
-    harmonic_tension: float = 0.5     # Dissonance level (0.0=consonant, 1.0=dissonant)
-    
+class KeyState:
+    """Tracks the complete state of a single keyboard key."""
+    key_char: str
+    is_active: bool = False
+    is_sustained: bool = False
+
+    def press(self):
+        self.is_active = True
+
+    def release(self, pedal_is_down: bool):
+        self.is_active = False
+        self.is_sustained = True if pedal_is_down else False
+
+    def lift_sustain(self):
+        self.is_sustained = False
+
     @property
-    def all_notes(self) -> List[NoteEvent]:
-        """Get all notes in both hands combined."""
-        return self.left_hand_notes + self.right_hand_notes
+    def is_physically_down(self) -> bool:
+        return self.is_active or self.is_sustained
 
 @dataclass
-class ScheduledEvent:
-    """Keyboard event scheduled for future execution with priority queue support."""
-    time: float          # When to execute event (seconds from start)
-    event_type: str      # Event type: 'press', 'release', or 'pedal'
-    key: str             # Keyboard key to press/release
-    midi_note: int       # Original MIDI note number
-    hand: str            # Hand assignment: 'left', 'right', or 'unknown'
-    velocity: int = 64   # Velocity for this specific event
-    finger: int = 0      # Finger assignment (0=thumb, 4=pinky)
-    
-    def __lt__(self, other):
-        """Priority queue comparison - earlier times have higher priority."""
-        return self.time < other.time
+class Finger:
+    """Represents the state of a single physical finger."""
+    id: int
+    hand: str
+    current_pitch: Optional[int] = None
+    last_press_time: float = -1.0
 
-@dataclass
-class DebugEvent:
-    """Debug information for a single playback event."""
-    timestamp: float     # When event occurred
-    event_type: str      # Type of event
-    hand: str           # Which hand
-    key: str            # Keyboard key
-    midi_note: int      # MIDI note
-    velocity: int       # Velocity used
-    timing_adj: float   # Timing adjustment applied
-    humanization: str   # Description of humanization applied
+class TempoMap:
+    """Stores all tempo changes and provides a lookup for any point in time."""
+    def __init__(self, tempo_events: List[Tuple[float, int]]):
+        self.events = sorted(tempo_events, key=lambda x: x[0])
 
-class MusicalAnalyzer:
-    """Analyzes MIDI content for intelligent humanization decisions."""
-    
-    # Major scale patterns for key detection - maps root note to scale degrees
-    MAJOR_SCALES = {
-        0: [0, 2, 4, 5, 7, 9, 11],   # C major: C D E F G A B
-        1: [1, 3, 5, 6, 8, 10, 0],   # C# major
-        2: [2, 4, 6, 7, 9, 11, 1],   # D major
-        3: [3, 5, 7, 8, 10, 0, 2],   # D# major
-        4: [4, 6, 8, 9, 11, 1, 3],   # E major
-        5: [5, 7, 9, 10, 0, 2, 4],   # F major
-        6: [6, 8, 10, 11, 1, 3, 5],  # F# major
-        7: [7, 9, 11, 0, 2, 4, 6],   # G major
-        8: [8, 10, 0, 1, 3, 5, 7],   # G# major
-        9: [9, 11, 1, 2, 4, 6, 8],   # A major
-        10: [10, 0, 2, 3, 5, 7, 9],  # A# major
-        11: [11, 1, 3, 4, 6, 8, 10]  # B major
-    }
-    
-    @staticmethod
-    def detect_key_signature(notes: List[NoteEvent]) -> int:
-        """Detect most likely key signature by analyzing note frequency distribution."""
-        # Count occurrences of each chromatic note
-        note_counts = [0] * 12
-        for note in notes:
-            note_counts[note.midi_note % 12] += 1
-        
-        # Test each possible key and score based on scale note frequency
-        best_score = -1
-        best_key = 0
-        
-        for key, scale in MusicalAnalyzer.MAJOR_SCALES.items():
-            # Calculate score as sum of scale note frequencies
-            score = sum(note_counts[note % 12] for note in scale)
-            if score > best_score:
-                best_score = score
-                best_key = key
-        
-        return best_key
-    
-    @staticmethod
-    def analyze_harmony(chord_notes: List[int]) -> float:
-        """Calculate harmonic tension of chord - 0.0=consonant, 1.0=dissonant."""
-        if len(chord_notes) < 2:
-            return 0.0
-        
-        # Calculate all intervals between chord notes
-        intervals = []
-        for i in range(len(chord_notes)):
-            for j in range(i + 1, len(chord_notes)):
-                interval = abs(chord_notes[i] - chord_notes[j]) % 12
-                intervals.append(interval)
-        
-        # Consonance ratings for each interval type
-        consonance = {
-            0: 1.0,   # Unison - perfect consonance
-            1: 0.1,   # Minor 2nd - very dissonant
-            2: 0.3,   # Major 2nd - mild dissonance
-            3: 0.6,   # Minor 3rd - mild consonance
-            4: 0.7,   # Major 3rd - consonant
-            5: 0.4,   # Perfect 4th - moderate
-            6: 0.2,   # Tritone - very dissonant
-            7: 0.8,   # Perfect 5th - very consonant
-            8: 0.7,   # Minor 6th - consonant
-            9: 0.6,   # Major 6th - mild consonance
-            10: 0.3,  # Minor 7th - mild dissonance
-            11: 0.1   # Major 7th - very dissonant
-        }
-        
-        # Average consonance across all intervals, convert to tension
-        avg_consonance = sum(consonance[interval] for interval in intervals) / len(intervals)
-        return 1.0 - avg_consonance
-    
-    @staticmethod
-    def detect_melody_line(notes: List[NoteEvent]) -> List[NoteEvent]:
-        """Identify main melody by finding highest voice at each time point."""
-        melody_notes = []
-        time_groups = {}
-        
-        # Group notes by quantized start time
-        for note in notes:
-            time_key = round(note.start_time, 3)  # 1ms precision
-            if time_key not in time_groups:
-                time_groups[time_key] = []
-            time_groups[time_key].append(note)
-        
-        # At each time point, mark highest note as melody
-        for time_key, group in time_groups.items():
-            highest = max(group, key=lambda n: n.midi_note)
-            highest.is_melody = True
-            melody_notes.append(highest)
-        
-        return melody_notes
-    
-    @staticmethod
-    def analyze_phrases(notes: List[NoteEvent], time_signature: Tuple[int, int] = (4, 4)) -> List[NoteEvent]:
-        """Analyze musical phrase structure and mark phrase boundaries."""
-        if not notes:
-            return notes
-        
-        # Sort notes chronologically for phrase analysis
-        sorted_notes = sorted(notes, key=lambda n: n.start_time)
-        
-        # Calculate phrase length - typically 8 beats in common practice
-        beats_per_phrase = 8
-        beat_length = 0.5  # Assume quarter note = 500ms
-        phrase_length = beats_per_phrase * beat_length
-        
-        # Assign phrase positions based on timing within phrase cycle
-        for note in sorted_notes:
-            phrase_pos = (note.start_time % phrase_length) / phrase_length
-            
-            if phrase_pos < 0.2:        # First 20% of phrase
-                note.phrase_position = "start"
-            elif phrase_pos > 0.8:      # Last 20% of phrase
-                note.phrase_position = "end"
-            else:                       # Middle 60% of phrase
-                note.phrase_position = "middle"
-        
-        return sorted_notes
+    def get_tempo_at(self, time: float) -> int:
+        if not self.events: return 500000
+        for event_time, tempo in reversed(self.events):
+            if time >= event_time: return tempo
+        return self.events[0][1]
 
-class MIDIKeyboardPlayer:
-    """Main MIDI keyboard player with comprehensive humanization and pedal control."""
-    
-    # Physical keyboard layout mapped to piano keys (white + black keys interleaved)
-    KEYBOARD_LAYOUT = "1!2@34$5%6^78*9(0qQwWeErtTyYuiIoOpPasSdDfgGhHjJklLzZxcCvVbBnm"
-    C4_INDEX = 24           # Position of middle C in keyboard layout
-    C4_MIDI = 60           # MIDI note number for middle C
-    HAND_SPLIT_NOTE = 60   # Notes below this go to left hand, above to right
-    
-    # Finger strength simulation - realistic strength differences between fingers
-    FINGER_STRENGTH = [1.0, 0.95, 0.9, 0.8, 0.7]  # thumb to pinky
-    
-    # Groove patterns for different musical styles - timing multipliers per beat
-    SWING_PATTERNS = {
-        'straight': [1.0, 1.0, 1.0, 1.0],          # Even timing
-        'swing': [1.0, 0.67, 1.0, 0.67],           # Jazz swing - long-short pattern
-        'shuffle': [1.0, 0.75, 1.0, 0.75],         # Blues shuffle
-        'latin': [1.0, 0.9, 1.1, 0.95]             # Latin groove with slight push/pull
-    }
-    
-    def __init__(self, tempo_scale=1.0, natural_timing=False, random_timing=False, 
-                 chord_aware=False, max_timing_variance=0.05, genre=None,
-                 expression_level=0.5, fatigue_simulation=False, mistake_rate=0.0,
-                 debug_mode=False):
-        """Initialize player with humanization parameters and setup keyboard controller."""
-        self.keyboard = Controller()
-        
-        # Core playback parameters
-        self.tempo_scale = tempo_scale                    # Global tempo multiplier
-        self.natural_timing = natural_timing              # Enable natural human timing variations
-        self.random_timing = random_timing                # Enable random timing/order variations
-        self.chord_aware = chord_aware                    # Enable intelligent chord analysis
-        self.max_timing_variance = max_timing_variance    # Maximum random timing deviation
-        self.genre = genre                                # Musical style for specialized humanization
-        self.expression_level = expression_level          # Emotional intensity (0.0-1.0)
-        self.fatigue_simulation = fatigue_simulation      # Enable performance degradation over time
-        self.mistake_rate = mistake_rate                  # Probability of simulated mistakes
-        self.debug_mode = debug_mode                      # Enable detailed debug output
-        
-        # Musical analysis state
-        self.key_signature = 0                # Detected key (0=C, 1=C#, etc.)
-        self.time_signature = (4, 4)         # Time signature (numerator, denominator)
-        self.current_tempo = 120.0            # Detected tempo in BPM
-        self.playing_time = 0.0               # Elapsed playing time for fatigue calculation
-        self.fatigue_factor = 1.0             # Current fatigue multiplier (1.0=fresh, 0.7=tired)
-        
-        # Performance tracking for realistic simulation
-        self.performance_quality = 1.0       # Overall performance quality factor
-        self.last_chord_time = 0.0           # Time of last chord for spacing calculation
-        self.phrase_dynamics = []            # Dynamic curve for current phrase
-        
-        # MIDI to keyboard mapping setup
-        self.base_midi_note = self.C4_MIDI - self.C4_INDEX
-        self.midi_to_key = self._create_midi_mapping()
-        
-        # Thread synchronization and state management
-        self.lock = threading.Lock()                      # Thread safety for shared state
-        self.stop_flag = threading.Event()               # Signal to stop all threads
-        self.currently_pressed_keys: Set[str] = set()    # Track active keys for display/cleanup
-        self.start_time = 0                               # Performance start time reference
-        self.running = False                              # Global running state flag
-        self.pedal_pressed = False                        # Sustain pedal state
-        
-        # Event scheduling system
-        self.event_queue = []                 # Priority queue for scheduled events
-        self.scheduler_thread = None          # Thread for event execution
-        self.display_thread = None            # Thread for real-time display
-        self.last_displayed_keys = set()      # Last displayed key set for change detection
-        
-        # Debug tracking
-        self.debug_history = []               # Complete history of debug events
-        self.current_left_hand = set()        # Currently pressed left hand keys
-        self.current_right_hand = set()       # Currently pressed right hand keys
-        
-        self._setup_signal_handlers()
-        
-    def _setup_signal_handlers(self):
-        """Configure signal handlers for graceful shutdown on Ctrl+C or system termination."""
-        def signal_handler(signum, frame):
-            self.stop_flag.set()
-            self.running = False
-            
-        signal.signal(signal.SIGINT, signal_handler)
-        if hasattr(signal, 'SIGTERM'):
-            signal.signal(signal.SIGTERM, signal_handler)
-    
-    def _create_midi_mapping(self) -> Dict[int, str]:
-        """Create bidirectional mapping from MIDI note numbers to keyboard characters."""
-        mapping = {}
-        for i, key in enumerate(self.KEYBOARD_LAYOUT):
-            midi_note = self.base_midi_note + i
-            mapping[midi_note] = key
-        return mapping
-    
-    def _map_note_to_key(self, midi_note: int) -> Optional[str]:
-        """Map MIDI note to keyboard key, auto-transposing out-of-range notes to nearest octave."""
-        if midi_note in self.midi_to_key:
-            return self.midi_to_key[midi_note]
-        
-        # Transpose by octaves until note fits in available range
-        while midi_note < self.base_midi_note:
-            midi_note += 12
-        while midi_note >= self.base_midi_note + len(self.KEYBOARD_LAYOUT):
-            midi_note -= 12
-            
-        return self.midi_to_key.get(midi_note)
-    
-    def _assign_finger(self, midi_note: int, hand: str, hand_notes: List[NoteEvent]) -> int:
-        """Assign realistic finger numbers based on note position within hand."""
-        if hand == 'left':
-            # Left hand: thumb plays highest notes, pinky plays lowest
-            sorted_notes = sorted(hand_notes, key=lambda n: n.midi_note, reverse=True)
-        else:
-            # Right hand: thumb plays lowest notes, pinky plays highest
-            sorted_notes = sorted(hand_notes, key=lambda n: n.midi_note)
-        
+
+class MidiParser:
+    @staticmethod
+    def parse(filepath: str, tempo_scale: float = 1.0) -> Tuple[List[Note], List[Tuple[float, int]]]:
         try:
-            # Find position of this note in sorted order
-            position = next(i for i, note in enumerate(sorted_notes) if note.midi_note == midi_note)
-            return min(position, 4)  # Clamp to valid finger range (0-4)
-        except StopIteration:
-            return 0  # Default to thumb if note not found
-    
-    def _get_beat_strength(self, time_pos: float, time_signature: Tuple[int, int] = (4, 4)) -> float:
-        """Calculate rhythmic emphasis based on position within measure - strong beats get emphasis."""
-        beats_per_measure = time_signature[0]
-        beat_length = 0.5  # Assume quarter note = 500ms for beat calculation
-        
-        beat_position = (time_pos / beat_length) % beats_per_measure
-        
-        # Assign strength based on traditional rhythmic hierarchy
-        if beat_position < 0.1:              # Downbeat (beat 1)
-            return 1.2
-        elif beat_position % 1.0 < 0.1:      # Other strong beats
-            return 1.0
-        elif beat_position % 0.5 < 0.1:      # Off-beats (syncopation)
-            return 0.9
-        else:                                # Weak subdivisions
-            return 0.8
-    
-    def _apply_swing(self, time_pos: float, genre: str = 'straight') -> float:
-        """Apply genre-specific timing adjustments for musical groove."""
-        if genre not in self.SWING_PATTERNS:
-            return time_pos
-        
-        pattern = self.SWING_PATTERNS[genre]
-        beat_length = 0.5
-        beat_position = (time_pos / beat_length) % len(pattern)
-        beat_index = int(beat_position)
-        
-        # Apply swing factor as timing adjustment
-        swing_factor = pattern[beat_index]
-        adjustment = (swing_factor - 1.0) * 0.05  # Max 50ms swing adjustment
-        
-        return time_pos + adjustment
-    
-    def _calculate_velocity_humanization(self, note: NoteEvent, finger: int, hand: str) -> int:
-        """Calculate realistic velocity based on finger strength, musical context, and humanization."""
-        base_velocity = note.velocity
-        
-        # Physical finger strength variation - thumb strongest, pinky weakest
-        finger_factor = self.FINGER_STRENGTH[finger]
-        
-        # Register-based dynamics - bass notes naturally heavier, treble lighter
-        if note.midi_note < 48:              # Bass register (below C3)
-            register_factor = 1.15
-        elif note.midi_note > 72:            # Treble register (above C5)
-            register_factor = 0.9
-        else:                                # Middle register
-            register_factor = 1.0
-        
-        # Emphasize melody line for musical clarity
-        melody_factor = 1.1 if note.is_melody else 1.0
-        
-        # Apply beat emphasis for rhythmic structure
-        beat_factor = note.beat_strength
-        
-        # Random humanization within reasonable bounds
-        random_factor = random.uniform(0.85, 1.15) if self.random_timing else 1.0
-        
-        # Fatigue causes gradual velocity reduction over time
-        fatigue_factor = self.fatigue_factor if self.fatigue_simulation else 1.0
-        
-        # Expression level controls overall dynamic range
-        expression_range = 0.3 * self.expression_level
-        expression_factor = 1.0 + random.uniform(-expression_range, expression_range)
-        
-        # Combine all factors multiplicatively
-        final_velocity = base_velocity * finger_factor * register_factor * melody_factor
-        final_velocity *= beat_factor * random_factor * fatigue_factor * expression_factor
-        
-        # Clamp to valid MIDI velocity range
-        return max(1, min(127, int(final_velocity)))
-    
-    def _calculate_timing_humanization(self, note: NoteEvent, chord_notes: List[NoteEvent], 
-                                     hand: str, finger: int) -> Tuple[float, float]:
-        """Calculate comprehensive timing adjustments for note press and duration."""
-        press_adjustment = 0.0
-        duration_adjustment = 0.0
-        
-        # Basic random timing variation if enabled
-        if self.random_timing:
-            if random.random() < 0.7:  # 70% chance of having timing variation
-                press_adjustment += random.uniform(-self.max_timing_variance, self.max_timing_variance)
-        
-        # Natural human timing characteristics
-        if self.natural_timing:
-            # Chord rolling - slight stagger between simultaneous notes
-            if len(chord_notes) > 1:
-                note_index = next((i for i, n in enumerate(chord_notes) if n.midi_note == note.midi_note), 0)
-                roll_delay = note_index * 0.005  # 5ms between each note in chord
-                press_adjustment += roll_delay
-            
-            # Musical phrase breathing - hesitation at phrase starts, lengthening at ends
-            if note.phrase_position == "start":
-                press_adjustment += random.uniform(0.0, 0.02)  # Up to 20ms hesitation
-            elif note.phrase_position == "end":
-                duration_adjustment += random.uniform(0.0, 0.05)  # Up to 50ms lengthening
-        
-        # Beat emphasis timing - strong beats slightly early for forward momentum
-        if note.beat_strength > 1.0:
-            press_adjustment -= 0.005  # Strong beats 5ms early
-        elif note.beat_strength < 0.9:
-            press_adjustment += 0.003  # Weak beats 3ms late
-        
-        # Genre-specific swing application
-        if self.genre in ['jazz', 'swing', 'blues']:
-            swing_adjustment = self._apply_swing(note.start_time, 'swing') - note.start_time
-            press_adjustment += swing_adjustment
-        
-        # Finger-dependent timing - weaker fingers are slightly slower
-        if finger > 2:  # Ring finger and pinky have delayed response
-            press_adjustment += 0.002 * (finger - 2)
-        
-        # Harmonic complexity affects timing precision
-        chord_midi_notes = [n.midi_note for n in chord_notes]
-        tension = MusicalAnalyzer.analyze_harmony(chord_midi_notes)
-        if tension > 0.7:  # High harmonic tension requires more careful timing
-            press_adjustment += 0.005
-        
-        # Fatigue effects - tired players have less precise timing
-        if self.fatigue_simulation:
-            press_adjustment += (1.0 - self.fatigue_factor) * 0.01
-            duration_adjustment -= (1.0 - self.fatigue_factor) * 0.02
-        
-        # Genre-specific timing characteristics
-        if self.genre == 'classical':
-            press_adjustment *= 0.7      # More precise, less variation
-        elif self.genre == 'jazz':
-            press_adjustment *= 1.3      # More swing and rhythmic freedom
-        elif self.genre == 'romantic':
-            # More rubato - emotional timing flexibility
-            press_adjustment += random.uniform(-0.01, 0.01) * self.expression_level
-        
-        return press_adjustment, duration_adjustment
-    
-    def _calculate_articulation(self, note: NoteEvent, next_note: Optional[NoteEvent] = None) -> float:
-        """Calculate note length based on musical articulation and context."""
-        base_duration = note.duration
-        
-        # Default articulation - slightly detached for clarity
-        articulation_factor = 0.95
-        
-        # Legato connection for smooth melody lines
-        if note.is_melody and next_note and abs(next_note.midi_note - note.midi_note) <= 2:
-            articulation_factor = 1.05  # Slight overlap for legato connection
-        
-        # Staccato articulation for short notes or fast passages
-        if base_duration < 0.2:  # Notes shorter than 200ms
-            articulation_factor = 0.8
-        
-        # Phrase-sensitive articulation adjustments
-        if note.phrase_position == "end":
-            articulation_factor *= 1.1  # Longer notes at phrase endings
-        
-        # Genre-specific articulation styles
-        if self.genre == 'baroque':
-            articulation_factor = 0.9   # More detached, historically informed
-        elif self.genre == 'romantic':
-            articulation_factor = 1.0   # More connected, expressive
-        
-        return base_duration * articulation_factor
-    
-    def _get_key_combination(self, key: str) -> Tuple[List, str]:
-        """Convert keyboard layout character to actual key combination needed."""
-        # Symbol mapping for shifted number keys
-        symbol_map = {
-            '!': '1', '@': '2', '#': '3', '$': '4', '%': '5',
-            '^': '6', '&': '7', '*': '8', '(': '9', ')': '0'
-        }
-        
-        if key in symbol_map:
-            return ([Key.shift], symbol_map[key])  # Shift + number for symbol
-        elif key.isupper():
-            return ([Key.shift], key.lower())      # Shift + letter for uppercase
-        else:
-            return ([], key)                       # Plain key press
-    
-    def _simulate_mistake(self, note: NoteEvent) -> bool:
-        """Simulate occasional human playing mistakes based on difficulty and fatigue."""
-        if self.mistake_rate <= 0:
-            return False
-        
-        # Base mistake probability from configuration
-        mistake_probability = self.mistake_rate
-        
-        # Fatigue increases mistake probability
-        if self.fatigue_simulation:
-            mistake_probability *= (2.0 - self.fatigue_factor)
-        
-        # Difficult finger combinations more prone to mistakes
-        if hasattr(note, 'finger') and note.finger > 3:
-            mistake_probability *= 1.5
-        
-        return random.random() < mistake_probability
-    
-    def _log_debug_event(self, event_type: str, hand: str, key: str, midi_note: int, 
-                        velocity: int, timing_adj: float, humanization: str):
-        """Log debug event for analysis and history tracking."""
-        if not self.debug_mode:
-            return
-            
-        debug_event = DebugEvent(
-            timestamp=time.perf_counter() - self.start_time,
-            event_type=event_type,
-            hand=hand,
-            key=key,
-            midi_note=midi_note,
-            velocity=velocity,
-            timing_adj=timing_adj,
-            humanization=humanization
-        )
-        
-        self.debug_history.append(debug_event)
-        
-        # Real-time debug output
-        hand_state = f"L:{sorted(self.current_left_hand)} R:{sorted(self.current_right_hand)}"
-        print(f"[{debug_event.timestamp:6.3f}] {event_type:7} {hand:5} {key:1} "
-              f"(MIDI:{midi_note:3}) vel:{velocity:3} adj:{timing_adj:+.3f}s | {hand_state}")
-    
-
-    def _group_notes_into_chords(self, notes: List[NoteEvent]) -> List[ChordGroup]:
-        """Group notes by timing and analyze musical structure for intelligent humanization."""
-        if not notes:
-            return []
-        
-        # Perform comprehensive musical analysis
-        self.key_signature = MusicalAnalyzer.detect_key_signature(notes)
-        melody_notes = MusicalAnalyzer.detect_melody_line(notes)
-        analyzed_notes = MusicalAnalyzer.analyze_phrases(notes, self.time_signature)
-        
-        # Apply beat strength analysis to all notes
-        for note in analyzed_notes:
-            note.beat_strength = self._get_beat_strength(note.start_time, self.time_signature)
-        
-        # Simple mode: treat each note as individual "chord"
-        if not self.chord_aware:
-            chord_groups = []
-            for note in analyzed_notes:
-                chord = ChordGroup(note.start_time, [], [note])
-                chord.beat_position = note.start_time % (self.time_signature[0] * 0.5)
-                chord.is_strong_beat = note.beat_strength > 1.0
-                chord_groups.append(chord)
-            return chord_groups
-        
-        # FIXED: Chord-aware mode with millisecond quantization to prevent floating-point precision issues
-        time_groups = {}
-        for note in analyzed_notes:
-            ms_time = int(note.start_time * 1000)  # Quantize to milliseconds
-            if ms_time not in time_groups:
-                time_groups[ms_time] = []
-            time_groups[ms_time].append(note)
-        
-        chord_groups = []
-        for ms_time, chord_notes in time_groups.items():
-            start_time = ms_time / 1000.0  # Convert back to seconds
-            
-            # Analyze chord characteristics for humanization
-            midi_notes = [n.midi_note for n in chord_notes]
-            harmonic_tension = MusicalAnalyzer.analyze_harmony(midi_notes)
-            complexity = min(len(chord_notes) / 6.0, 1.0)  # Normalize to 0-1 range
-            
-            # Hand assignment based on Middle C split point
-            left_hand = [n for n in chord_notes if n.midi_note <= self.HAND_SPLIT_NOTE]
-            right_hand = [n for n in chord_notes if n.midi_note > self.HAND_SPLIT_NOTE]
-            
-            # Handle hand overflow (>5 notes per hand) by reassigning notes
-            if len(left_hand) > 5:
-                # Move highest left-hand notes to right hand
-                sorted_left = sorted(left_hand, key=lambda n: n.midi_note)
-                overflow_count = len(left_hand) - 5
-                overflow_notes = sorted_left[-overflow_count:]
-                left_hand = sorted_left[:-overflow_count]
-                right_hand.extend(overflow_notes)
-            
-            if len(right_hand) > 5:
-                # Move lowest right-hand notes to left hand
-                sorted_right = sorted(right_hand, key=lambda n: n.midi_note)
-                overflow_count = len(right_hand) - 5
-                overflow_notes = sorted_right[:overflow_count]
-                right_hand = sorted_right[overflow_count:]
-                left_hand.extend(overflow_notes)
-            
-            # Create analyzed chord group
-            chord = ChordGroup(start_time, left_hand, right_hand)
-            chord.beat_position = start_time % (self.time_signature[0] * 0.5)
-            chord.is_strong_beat = any(n.beat_strength > 1.0 for n in chord_notes)
-            chord.chord_complexity = complexity
-            chord.harmonic_tension = harmonic_tension
-            
-            chord_groups.append(chord)
-        
-        return sorted(chord_groups, key=lambda c: c.start_time)
-    
-    def _apply_humanization_to_chord(self, chord: ChordGroup) -> List[Tuple[float, str, str, int, str, int]]:
-        """Apply comprehensive humanization to chord group, returning scheduled events."""
-        events = []
-        
-        # Update fatigue simulation based on elapsed playing time
-        if self.fatigue_simulation:
-            time_played = chord.start_time
-            # Gradual fatigue over 10 minutes (600 seconds)
-            self.fatigue_factor = max(0.7, 1.0 - (time_played / 600.0) * 0.3)
-        
-        # Process each hand separately for realistic coordination
-        for hand, hand_notes in [('left', chord.left_hand_notes), ('right', chord.right_hand_notes)]:
-            if not hand_notes:
-                continue
-            
-            # Assign finger numbers based on hand position and note arrangement
-            for note in hand_notes:
-                note.finger = self._assign_finger(note.midi_note, hand, hand_notes)
-            
-            # Apply note ordering based on humanization settings
-            if self.random_timing:
-                # Random order for experimental/avant-garde effect
-                hand_notes = hand_notes.copy()
-                random.shuffle(hand_notes)
-            elif self.natural_timing and len(hand_notes) > 1:
-                # Natural chord rolling: bass-to-treble for left, treble-to-bass for right
-                if hand == 'left':
-                    hand_notes = sorted(hand_notes, key=lambda n: n.midi_note)
-                else:
-                    hand_notes = sorted(hand_notes, key=lambda n: n.midi_note, reverse=True)
-            
-            # Apply humanization to each individual note
-            for i, note in enumerate(hand_notes):
-                # Skip note if mistake simulation triggers
-                if self._simulate_mistake(note):
-                    continue
-                
-                # Map MIDI note to keyboard key
-                key = self._map_note_to_key(note.midi_note)
-                if not key:
-                    continue
-                
-                # Calculate comprehensive timing adjustments
-                press_adjustment, duration_adjustment = self._calculate_timing_humanization(
-                    note, hand_notes, hand, note.finger
-                )
-                
-                # Calculate humanized velocity based on multiple factors
-                velocity = self._calculate_velocity_humanization(note, note.finger, hand)
-                
-                # Calculate articulation-adjusted duration
-                articulated_duration = self._calculate_articulation(note)
-                
-                # Apply all timing and duration adjustments
-                actual_press_time = max(0, note.start_time + press_adjustment)
-                actual_duration = max(0.05, articulated_duration + duration_adjustment)
-                actual_release_time = actual_press_time + actual_duration
-                
-                # Create humanization description for debug logging
-                humanization_desc = f"finger:{note.finger} tension:{chord.harmonic_tension:.2f}"
-                if self.fatigue_simulation:
-                    humanization_desc += f" fatigue:{self.fatigue_factor:.2f}"
-                
-                # Log debug information if enabled
-                self._log_debug_event('press', hand, key, note.midi_note, velocity, 
-                                    press_adjustment, humanization_desc)
-                
-                # Schedule press and release events (simple approach)
-                events.append((actual_press_time, 'press', key, note.midi_note, hand, velocity))
-                events.append((actual_release_time, 'release', key, note.midi_note, hand, velocity))
-        
-        return events
-    
-    def _press_key(self, key: str, midi_note: int, velocity: int = 64):
-        """Execute keyboard key press - allows overlapping presses."""
-        if self.stop_flag.is_set():
-            return
-            
-        with self.lock:
-            # Remove the overlap prevention check - always press the key
-            try:
-                modifiers, base_key = self._get_key_combination(key)
-                requires_shift = Key.shift in modifiers
-                
-                # Use separate controller instance for atomic operations
-                controller = Controller()
-                
-                if requires_shift:
-                    # Atomic shift+key operation using context manager
-                    with controller.pressed(Key.shift):
-                        time.sleep(0.0005)  # Micro-delay for OS processing
-                        controller.press(base_key)
-                        time.sleep(0.0005)  # Ensure key registers in shift context
-                    # Shift automatically released by context manager
-                else:
-                    # Normal key press without modifiers
-                    controller.press(base_key)
-                    time.sleep(0.001)  # Standard delay for OS processing
-                
-                self.currently_pressed_keys.add(key)
-                
-                # Update hand tracking for debug display
-                if self.debug_mode:
-                    # Determine hand based on MIDI note (rough approximation)
-                    if midi_note <= self.HAND_SPLIT_NOTE:
-                        self.current_left_hand.add(key)
-                    else:
-                        self.current_right_hand.add(key)
-                
-            except Exception:
-                pass  # Silently handle key press failures
-    
-    def _release_key(self, key: str, midi_note: int, velocity: int = 64):
-        """Execute keyboard key release."""
-        if self.stop_flag.is_set():
-            return
-            
-        with self.lock:
-            # Always attempt to release the key
-            try:
-                modifiers, base_key = self._get_key_combination(key)
-                
-                # Use main keyboard controller for release
-                self.keyboard.release(base_key)
-                time.sleep(0.001)  # Allow OS to process release
-                
-                self.currently_pressed_keys.discard(key)
-                
-                # Update hand tracking for debug display
-                if self.debug_mode:
-                    self.current_left_hand.discard(key)
-                    self.current_right_hand.discard(key)
-                    self._log_debug_event('release', 'both', key, midi_note, velocity, 0, 'normal')
-                
-            except Exception:
-                pass  # Silently handle key release failures
-    
-    def _handle_pedal(self, pedal_state: bool):
-        """Handle sustain pedal press/release using spacebar."""
-        if self.stop_flag.is_set():
-            return
-            
-        try:
-            if pedal_state and not self.pedal_pressed:
-                # Press pedal (spacebar down)
-                self.keyboard.press(Key.space)
-                self.pedal_pressed = True
-                if self.debug_mode:
-                    self._log_debug_event('pedal', 'both', 'SPACE', 0, 127, 0, 'sustain_on')
-            elif not pedal_state and self.pedal_pressed:
-                # Release pedal (spacebar up)
-                self.keyboard.release(Key.space)
-                self.pedal_pressed = False
-                if self.debug_mode:
-                    self._log_debug_event('pedal', 'both', 'SPACE', 0, 0, 0, 'sustain_off')
-        except Exception:
-            pass  # Silently handle pedal failures
-    
-    def _schedule_event(self, event_time: float, event_type: str, key: str, 
-                       midi_note: int, hand: str = 'unknown', velocity: int = 64):
-        """Add event to priority queue for future execution."""
-        if event_type == 'pedal':
-            # Special handling for pedal events
-            event = ScheduledEvent(event_time, event_type, key, midi_note, hand, velocity)
-        else:
-            # Normal note events
-            event = ScheduledEvent(event_time, event_type, key, midi_note, hand, velocity)
-        heapq.heappush(self.event_queue, event)
-    
-    def _schedule_chord(self, chord: ChordGroup):
-        """Schedule entire chord with comprehensive humanization applied."""
-        humanized_events = self._apply_humanization_to_chord(chord)
-        
-        # Add all humanized events to the scheduler queue
-        for event_time, event_type, key, midi_note, hand, velocity in humanized_events:
-            self._schedule_event(event_time, event_type, key, midi_note, hand, velocity)
-        
-        # Add basic pedal simulation for longer chords (>1 second)
-        if chord.all_notes and max(note.duration for note in chord.all_notes) > 1.0:
-            # Press pedal slightly before chord
-            self._schedule_event(chord.start_time - 0.01, 'pedal', 'SPACE', 0, 'both', 127)
-            # Release pedal after longest note
-            max_end_time = max(note.end_time for note in chord.all_notes)
-            self._schedule_event(max_end_time + 0.1, 'pedal', 'SPACE', 0, 'both', 0)
-    
-    def _scheduler_loop(self):
-        """Main event scheduler loop with timing compensation for consistent playback."""
-        start_perf = time.perf_counter()
-        accumulated_delay = 0.0
-        
-        while self.running and not self.stop_flag.is_set():
-            current_time = time.perf_counter() - start_perf
-            
-            # Check if any events are ready for execution
-            if self.event_queue and self.event_queue[0].time <= (current_time + accumulated_delay):
-                event = heapq.heappop(self.event_queue)
-                
-                operation_start = time.perf_counter()
-                
-                # Execute event based on type
-                if event.event_type == 'press':
-                    self._press_key(event.key, event.midi_note, event.velocity)
-                elif event.event_type == 'release':
-                    self._release_key(event.key, event.midi_note, event.velocity)
-                elif event.event_type == 'pedal':
-                    pedal_state = event.velocity > 0  # velocity > 0 = press, 0 = release
-                    self._handle_pedal(pedal_state)
-                
-                # Track operation time for timing compensation
-                operation_time = time.perf_counter() - operation_start
-                accumulated_delay += operation_time
-            else:
-                # No events ready - brief sleep to prevent CPU spinning
-                time.sleep(0.001)
-    
-    def _display_current_keys(self):
-        """Display current key state - minimal for normal mode, detailed for debug mode."""
-        while self.running and not self.stop_flag.is_set():
-            with self.lock:
-                current_keys = self.currently_pressed_keys.copy()
-            
-            # Only update display when keys change to reduce flicker
-            if current_keys != self.last_displayed_keys:
-                sys.stdout.write('\r' + ' ' * 120 + '\r')
-                
-                if self.debug_mode:
-                    # Debug mode: show detailed hand information
-                    left_display = ' '.join(sorted(self.current_left_hand))
-                    right_display = ' '.join(sorted(self.current_right_hand))
-                    
-                    if current_keys:
-                        pedal_indicator = " [PEDAL]" if self.pedal_pressed else ""
-                        genre_tag = f"[{self.genre.upper()}]" if self.genre else "[NO GENRE]"
-                        fatigue_info = f" fatigue:{self.fatigue_factor:.2f}" if self.fatigue_simulation else ""
-                        
-                        display = f"🎹 {genre_tag} L:[{left_display}] R:[{right_display}]{pedal_indicator}{fatigue_info}"
-                        sys.stdout.write(display)
-                    else:
-                        genre_tag = f"[{self.genre.upper()}]" if self.genre else "[NO GENRE]"
-                        sys.stdout.write(f"🎹 {genre_tag} Ready")
-                else:
-                    # Normal mode: minimal display (only for debug flag)
-                    pass  # No output in normal mode
-                
-                sys.stdout.flush()
-                self.last_displayed_keys = current_keys
-            
-            time.sleep(0.05)  # 20Hz update rate
-    
-    def load_midi_file(self, filename: str) -> List[ChordGroup]:
-        """Load MIDI file and parse into chord groups with comprehensive musical analysis."""
-        try:
-            mid = mido.MidiFile(filename)
+            mid = mido.MidiFile(filepath)
         except Exception as e:
-            raise ValueError(f"Error loading MIDI file: {e}")
-        
-        notes = []
-        current_time = 0
-        active_notes = {}
-        
-        # Extract musical metadata from MIDI file
-        for track in mid.tracks:
-            for msg in track:
-                if msg.type == 'set_tempo':
-                    self.current_tempo = mido.tempo2bpm(msg.tempo)
-                elif msg.type == 'time_signature':
-                    self.time_signature = (msg.numerator, msg.denominator)
-        
-        # Process all MIDI note events into NoteEvent objects
-        for msg in mid:
-            current_time += msg.time / self.tempo_scale  # Fixed: divide instead of multiply
-            
-            if msg.type == 'note_on' and msg.velocity > 0:
-                # Note start - store in active notes dictionary
-                active_notes[msg.note] = {
-                    'start_time': current_time,
-                    'velocity': msg.velocity
-                }
+            raise IOError(f"Could not read or parse MIDI file: {e}")
+        notes: List[Note] = []
+        tempo_map_data: List[Tuple[float, int]] = []
+        open_notes: Dict[int, List[Dict]] = defaultdict(list)
+        absolute_time: float = 0.0
+        tempo = 500000
+        ticks_per_beat = mid.ticks_per_beat or 480
+        tempo_map_data.append((0.0, tempo))
+        note_id_counter = 0
+        for msg in mido.merge_tracks(mid.tracks):
+            absolute_time += mido.tick2second(msg.time, ticks_per_beat, tempo)
+            if msg.type == 'set_tempo':
+                tempo = msg.tempo
+                tempo_map_data.append((absolute_time, tempo))
+            elif msg.type == 'note_on' and msg.velocity > 0:
+                open_notes[msg.note].append({'start': absolute_time, 'vel': msg.velocity})
             elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                # Note end - create NoteEvent if note was active
-                if msg.note in active_notes:
-                    note_data = active_notes.pop(msg.note)
-                    duration = current_time - note_data['start_time']
-                    
-                    note_event = NoteEvent(
-                        midi_note=msg.note,
-                        start_time=note_data['start_time'],
-                        duration=duration,
-                        velocity=note_data['velocity']
-                    )
-                    notes.append(note_event)
-        
-        # Group notes into chords with full musical analysis
-        chord_groups = self._group_notes_into_chords(notes)
-        return chord_groups
-    
-    def _get_user_confirmation(self) -> bool:
-        """Get user confirmation before starting playback."""
-        while True:
-            try:
-                response = input("Start playback? (y/n): ").strip().lower()
-                if response in ['y', 'yes']:
-                    return True
-                elif response in ['n', 'no']:
-                    return False
-                else:
-                    print("Please enter 'y' or 'n'")
-            except (EOFError, KeyboardInterrupt):
-                return False
-    
-    def countdown(self, seconds=3):
-        """Display countdown before starting playback."""
-        print(f"Starting in:", end="")
-        for i in range(seconds, 0, -1):
-            if self.stop_flag.is_set():
-                return
-            print(f" {i}", end="", flush=True)
-            time.sleep(1)
-        print(" GO!")
-    
-    def _cleanup_keys(self):
-        """Release all currently pressed keys and cleanup stuck modifiers."""
-        with self.lock:
-            keys_to_release = list(self.currently_pressed_keys)
-        
-        # Release all active keys
-        for key in keys_to_release:
-            try:
-                modifiers, base_key = self._get_key_combination(key)
-                self.keyboard.release(base_key)
-            except Exception:
-                pass
-        
-        # Force cleanup any stuck modifiers and pedal
-        try:
-            self.keyboard.release(Key.shift)
-            self.keyboard.release(Key.ctrl)
-            self.keyboard.release(Key.alt)
-            self.keyboard.release(Key.space)  # Release pedal
-        except Exception:
-            pass
-        
-        with self.lock:
-            self.currently_pressed_keys.clear()
-            if self.debug_mode:
-                self.current_left_hand.clear()
-                self.current_right_hand.clear()
-        
-        self.pedal_pressed = False
-    
-    def _cleanup_threads(self, timeout=2):
-        """Clean up threads with aggressive termination and timeout handling."""
-        if self.debug_mode:
-            print("\nStopping threads...")
-        
-        # Set stop flags first
-        self.running = False
-        self.stop_flag.set()
-        
-        # Give threads a moment to see the stop flags
-        time.sleep(0.1)
-        
-        # Try to join scheduler thread with timeout
-        if self.scheduler_thread and self.scheduler_thread.is_alive():
-            self.scheduler_thread.join(timeout=timeout)
-            if self.scheduler_thread.is_alive() and self.debug_mode:
-                print("Warning: Scheduler thread did not stop cleanly")
-        
-        # Try to join display thread with timeout
-        if self.display_thread and self.display_thread.is_alive():
-            self.display_thread.join(timeout=timeout)
-            if self.display_thread.is_alive() and self.debug_mode:
-                print("Warning: Display thread did not stop cleanly")
-        
-        # Clear the display line
-        sys.stdout.write('\r' + ' ' * 120 + '\r')
-        sys.stdout.flush()
-    
-    def play_midi_file(self, filename: str, confirmation_enabled=True, countdown_enabled=True):
-        """Main playback function with comprehensive setup and execution."""
-        # Load and analyze MIDI file
-        chord_groups = self.load_midi_file(filename)
-        
-        if not chord_groups:
-            print("No notes found!")
-            return
-        
-        # Display comprehensive file analysis
-        total_notes = sum(len(chord.all_notes) for chord in chord_groups)
-        print(f"Loaded {total_notes} notes in {len(chord_groups)} chord groups")
-        print(f"Key signature: {self.key_signature} | Time signature: {self.time_signature[0]}/{self.time_signature[1]}")
-        print(f"Tempo: {self.current_tempo:.1f} BPM | Genre: {self.genre or 'None'}")
-        
-        # Show hand distribution for chord-aware mode
-        if self.chord_aware:
-            left_hand_chords = sum(1 for chord in chord_groups if chord.left_hand_notes)
-            right_hand_chords = sum(1 for chord in chord_groups if chord.right_hand_notes)
-            print(f"Hand distribution: {left_hand_chords} left, {right_hand_chords} right chord groups")
-        
-        # Display active humanization features
-        features = []
-        if self.natural_timing: features.append("natural timing")
-        if self.random_timing: features.append("random timing")
-        if self.fatigue_simulation: features.append("fatigue simulation")
-        if self.mistake_rate > 0: features.append(f"mistakes ({self.mistake_rate:.1%})")
-        if self.expression_level > 0: features.append(f"expression ({self.expression_level:.1f})")
-        if self.debug_mode: features.append("debug mode")
-        
-        if features:
-            print(f"Humanization: {', '.join(features)}")
-        
-        # User confirmation step
-        if confirmation_enabled and not self._get_user_confirmation():
-            return
-        
-        # Countdown before playback
-        if countdown_enabled:
-            self.countdown()
-            if self.stop_flag.is_set():
-                return
-        
-        # Initialize playback state
-        self.running = True
-        self.start_time = time.perf_counter()
-        
-        # Start background threads
-        self.scheduler_thread = threading.Thread(target=self._scheduler_loop)
-        self.display_thread = threading.Thread(target=self._display_current_keys)
-        
-        self.scheduler_thread.start()
-        self.display_thread.start()
-        
-        # Schedule all chord groups for playback
-        for chord in chord_groups:
-            if self.stop_flag.is_set():
-                break
-            self._schedule_chord(chord)
-        
-        # Wait for playback completion
-        if chord_groups and not self.stop_flag.is_set():
-            # Calculate total duration including all note endings
-            total_duration = max(note.end_time for chord in chord_groups for note in chord.all_notes)
-            end_time = time.perf_counter() + total_duration + 2  # Extra 2 seconds for cleanup
-            
-            while time.perf_counter() < end_time and not self.stop_flag.is_set():
-                time.sleep(0.1)
-        
-        # Force cleanup regardless of how we got here
-        self.running = False
-        self.stop_flag.set()
-        
-        try:
-            self._cleanup_threads()
-            self._cleanup_keys()
-        except Exception as e:
-            if self.debug_mode:
-                print(f"Cleanup error: {e}")
-        
-        # Final status message
-        if self.stop_flag.is_set():
-            print("Playback interrupted!")
-        else:
-            print("Done!")
-        
-        # Debug summary
-        if self.debug_mode and self.debug_history:
-            print(f"\nDebug Summary: {len(self.debug_history)} events logged")
-        
-        # Ensure clean output
-        sys.stdout.write('\n')
-        sys.stdout.flush()
+                if open_notes[msg.note]:
+                    note_data = open_notes[msg.note].pop(0)
+                    start = note_data['start']
+                    duration = absolute_time - start
+                    if duration > 0.01:
+                        scaled_start = start / tempo_scale
+                        scaled_duration = duration / tempo_scale
+                        notes.append(Note(id=note_id_counter, pitch=msg.note, velocity=note_data['vel'], start_time=scaled_start, duration=scaled_duration))
+                        note_id_counter += 1
+        notes.sort(key=lambda n: n.start_time)
+        return notes, tempo_map_data
 
-def main():
-    """Main function with comprehensive command-line interface and argument validation."""
-    parser = argparse.ArgumentParser(description="MIDI-to-Keyboard Player with Full Humanization and Pedal Control")
-    
-    # Required argument
-    parser.add_argument('midi_file', help='MIDI file to play')
-    
-    # Basic playback parameters
-    parser.add_argument('--tempo', type=float, default=1.0, help='Tempo scaling factor: 2.0=2x faster, 0.5=2x slower (default: 1.0)')
-    
-    # Core humanization flags
-    parser.add_argument('-n', '--natural', action='store_true', 
-                       help='Enable natural timing variations and chord rolling')
-    parser.add_argument('-r', '--random-timing', action='store_true',
-                       help='Enable random timing variations and note order')
-    parser.add_argument('-c', '--chord-aware', action='store_true',
-                       help='Enable chord grouping and hand assignment')
-    
-    # Advanced humanization parameters
-    parser.add_argument('--genre', choices=['classical', 'jazz', 'romantic', 'baroque', 'blues', 'pop'], 
-                       help='Musical genre for style-specific humanization (default: none)')
-    parser.add_argument('--expression', type=float, default=0.5, 
-                       help='Expression level 0.0-1.0 (default: 0.5)')
-    parser.add_argument('--fatigue', action='store_true', 
-                       help='Enable fatigue simulation over time')
-    parser.add_argument('--mistakes', type=float, default=0.0, 
-                       help='Mistake rate 0.0-0.1 (default: 0.0)')
-    
-    # Timing fine-tuning
-    parser.add_argument('--timing-variance', type=float, default=0.05,
-                       help='Maximum timing variance in seconds (default: 0.05)')
-    
-    # Interface and debug options
-    parser.add_argument('--debug', action='store_true', 
-                       help='Enable detailed debug output with playback history')
-    parser.add_argument('--no-confirmation', action='store_true', help='Skip confirmation prompt')
-    parser.add_argument('--no-countdown', action='store_true', help='Skip countdown before playback')
-    
-    args = parser.parse_args()
-    
-    # Validate all numeric parameters
-    if args.timing_variance < 0 or args.timing_variance > 0.5:
-        print("Error: Timing variance must be between 0.0 and 0.5 seconds")
-        sys.exit(1)
-    
-    if args.tempo <= 0:
-        print("Error: Tempo must be greater than 0")
-        sys.exit(1)
-    
-    if args.expression < 0 or args.expression > 1:
-        print("Error: Expression level must be between 0.0 and 1.0")
-        sys.exit(1)
-    
-    if args.mistakes < 0 or args.mistakes > 0.1:
-        print("Error: Mistake rate must be between 0.0 and 0.1")
-        sys.exit(1)
-    
-    # Create player with all specified parameters
-    player = MIDIKeyboardPlayer(
-        tempo_scale=args.tempo,
-        natural_timing=args.natural,
-        random_timing=args.random_timing,
-        chord_aware=args.chord_aware,
-        max_timing_variance=args.timing_variance,
-        genre=args.genre,  # Can be None if not specified
-        expression_level=args.expression,
-        fatigue_simulation=args.fatigue,
-        mistake_rate=args.mistakes,
-        debug_mode=args.debug
-    )
-    
-    # Display comprehensive startup information
-    features = []
-    if args.natural: features.append("natural timing")
-    if args.random_timing: features.append("random timing")
-    if args.chord_aware: features.append("chord-aware")
-    if args.fatigue: features.append("fatigue simulation")
-    if args.mistakes > 0: features.append(f"mistakes ({args.mistakes:.1%})")
-    if args.expression > 0: features.append(f"expression ({args.expression:.1f})")
-    if args.debug: features.append("debug mode")
-    
-    print(f"🎹 Enhanced MIDI Player with Pedal Control")
-    print(f"Genre: {args.genre.title() if args.genre else 'None'} | Tempo: {args.tempo}x")
-    if features:
-        print(f"Features: {', '.join(features)}")
-    if args.debug:
-        print("Debug mode: Detailed output enabled")
-    
-    # Execute main playback with comprehensive error handling
-    try:
-        player.play_midi_file(
-            args.midi_file, 
-            confirmation_enabled=not args.no_confirmation,
-            countdown_enabled=not args.no_countdown
-        )
-    except KeyboardInterrupt:
-        print("\nInterrupted by user")
-        player.stop_flag.set()
-        player.running = False
-    except Exception as e:
-        print(f"Error: {e}")
-        player.stop_flag.set()
-        player.running = False
-    finally:
-        # Ensure absolutely clean exit
-        try:
-            player.stop_flag.set()
-            player.running = False
-            time.sleep(0.1)  # Give threads time to stop gracefully
-        except:
-            pass
+class KeyMapper:
+    LAYOUT = "1!2@34$5%6^78*9(0qQwWeErtTyYuiIoOpPasSdDfgGhHjJklLzZxcCvVbBnm"
+    SYMBOL_MAP = {'!': '1', '@': '2', '#': '3', '$': '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0'}
+    PITCH_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    BLACK_KEY_PITCH_CLASSES = {1, 3, 6, 8, 10}
+    def __init__(self):
+        c4_index = self.LAYOUT.find('t')
+        self.base_note = 60 - c4_index
+        self.key_map = {self.base_note + i: key for i, key in enumerate(self.LAYOUT)}
+        self.min_pitch, self.max_pitch = self.base_note, self.base_note + len(self.LAYOUT) - 1
+    def get_key_for_pitch(self, pitch: int) -> Optional[str]:
+        if self.min_pitch <= pitch <= self.max_pitch: return self.key_map.get(pitch)
+        transposed_pitch = pitch
+        if transposed_pitch < self.min_pitch:
+            while transposed_pitch < self.min_pitch: transposed_pitch += 12
+        elif transposed_pitch > self.max_pitch:
+            while transposed_pitch > self.max_pitch: transposed_pitch -= 12
+        return self.key_map.get(transposed_pitch)
+    def get_key_press_info(self, key_char: str) -> Tuple[List[Key], str]:
+        if key_char in self.SYMBOL_MAP: return ([Key.shift], self.SYMBOL_MAP[key_char])
+        if key_char.isupper(): return ([Key.shift], key_char.lower())
+        return ([], key_char)
+    @staticmethod
+    def pitch_to_name(pitch: int) -> str:
+        octave = (pitch // 12) - 1
+        note_name = KeyMapper.PITCH_NAMES[pitch % 12]
+        return f"{note_name}{octave}"
+    @staticmethod
+    def is_black_key(pitch: int) -> bool:
+        return pitch % 12 in KeyMapper.BLACK_KEY_PITCH_CLASSES
+
+def get_time_groups(notes: List[Note], threshold: float = 0.015) -> List[List[Note]]:
+    if not notes: return []
+    groups, current_group = [], [notes[0]]
+    for i in range(1, len(notes)):
+        if notes[i].start_time - current_group[0].start_time <= threshold: current_group.append(notes[i])
+        else:
+            groups.append(current_group)
+            current_group = [notes[i]]
+    groups.append(current_group)
+    return groups
+
+class Humanizer:
+    def __init__(self, config: Dict):
+        self.config = config
+        self.left_hand_drift = 0.0
+        self.right_hand_drift = 0.0
+
+    def apply_to_hand(self, notes: List[Note], hand: str, resync_points: Set[float]):
+        if not any([self.config.get('vary_timing'), self.config.get('vary_articulation'), self.config.get('vary_velocity'), self.config.get('enable_drift_correction'), self.config.get('enable_chord_roll')]):
+            return
+        time_groups = get_time_groups(notes)
+        for group in time_groups:
+            is_resync_point = round(group[0].start_time, 2) in resync_points
+            if self.config.get('enable_drift_correction') and is_resync_point:
+                if hand == 'left': self.left_hand_drift *= self.config.get('drift_decay_factor')
+                else: self.right_hand_drift *= self.config.get('drift_decay_factor')
+            group_timing_offset = 0.0
+            if self.config.get('vary_timing'):
+                group_timing_offset = (random.random() - 0.5) * 2 * self.config.get('timing_variance')
+            group_articulation = self.config.get('articulation')
+            if self.config.get('vary_articulation'):
+                group_articulation -= (random.random() * 0.1)
+            if self.config.get('enable_chord_roll') and len(group) > 1:
+                group.sort(key=lambda n: n.pitch)
+                for i, note in enumerate(group): note.start_time += i * 0.006
+            for note in group:
+                current_drift = self.left_hand_drift if hand == 'left' else self.right_hand_drift
+                note.start_time += group_timing_offset
+                if self.config.get('enable_drift_correction'):
+                    note.start_time += current_drift
+                note.duration *= group_articulation
+                if self.config.get('vary_velocity'):
+                    note.velocity = max(1, int(note.velocity * (1 + (random.random() - 0.5) * 0.2)))
+            if self.config.get('enable_drift_correction'):
+                if hand == 'left': self.left_hand_drift += group_timing_offset
+                else: self.right_hand_drift += group_timing_offset
+
+    def apply_tempo_rubato(self, all_notes: List[Note], sections: List[MusicalSection]):
+        if not self.config.get('enable_tempo_sway'):
+            return
         
-        # Force exit if still hanging
-        sys.exit(0)
+        base_intensity = self.config.get('tempo_sway_intensity', 0.0)
+        note_map = {note.id: note for note in all_notes}
+
+        for section in sections:
+            if section.pace_label == 'fast':
+                pace_multiplier = 0.25
+            elif section.pace_label == 'slow':
+                pace_multiplier = 1.5
+            else:
+                pace_multiplier = 1.0
+
+            for phrase in section.rhythmic_phrases:
+                phrase_duration = phrase.end_time - phrase.start_time
+                if phrase_duration < 1.0: continue
+
+                phrase_intensity = random.uniform(0.5, 1.0) * base_intensity * pace_multiplier
+                if phrase_intensity == 0: continue
+
+                phase_shift = random.uniform(-np.pi / 4, np.pi / 4)
+
+                for note_in_phrase in phrase.notes:
+                    if note_in_phrase.id in note_map:
+                        note_to_modify = note_map[note_in_phrase.id]
+                        
+                        relative_pos = (note_to_modify.start_time - phrase.start_time) / phrase_duration
+                        angle = relative_pos * np.pi + phase_shift
+                        sine_offset = np.sin(angle)
+                        
+                        time_shift = sine_offset * phrase_intensity
+                        note_to_modify.start_time -= time_shift
+
+
+class FingeringEngine:
+    TRAVEL_WEIGHT, RECENCY_WEIGHT, STRETCH_WEIGHT = 1.0, 150.0, 0.5
+    CROSSOVER_PENALTY, THUMB_ON_BLACK_KEY_PENALTY = 50.0, 20.0
+    MAX_HAND_SPAN = 14
+    def __init__(self):
+        self.fingers = [Finger(id=i, hand='left') for i in range(5)] + [Finger(id=i, hand='right') for i in range(5, 10)]
+    def assign_hands(self, notes: List[Note]):
+        time_groups = get_time_groups(notes)
+        for group in time_groups:
+            if len(group) == 1: self._assign_single_note(group[0])
+            else: self._assign_chord(group)
+    def _update_finger_state(self, finger: Finger, note: Note):
+        finger.current_pitch = note.pitch; finger.last_press_time = note.start_time
+    def _calculate_cost(self, finger: Finger, note: Note) -> float:
+        if finger.current_pitch is None: return 0
+        travel_cost = abs(finger.current_pitch - note.pitch) * self.TRAVEL_WEIGHT; recency_cost = 0
+        if finger.id in [f.id for f in self.fingers if f.last_press_time == finger.last_press_time]:
+             time_gap = note.start_time - finger.last_press_time
+             if 1e-6 < time_gap < 0.5: recency_cost = self.RECENCY_WEIGHT / time_gap
+        thumb_cost = self.THUMB_ON_BLACK_KEY_PENALTY if finger.id in [0, 5] and KeyMapper.is_black_key(note.pitch) else 0
+        stretch_cost, crossover_cost = 0, 0
+        other_fingers_on_hand = [f for f in self.fingers if f.hand == finger.hand and f.id != finger.id and f.current_pitch is not None]
+        if other_fingers_on_hand:
+            all_pitches = [f.current_pitch for f in other_fingers_on_hand] + [note.pitch]
+            span = max(all_pitches) - min(all_pitches)
+            if span > self.MAX_HAND_SPAN: stretch_cost = (span - self.MAX_HAND_SPAN) * self.STRETCH_WEIGHT
+            for other in other_fingers_on_hand:
+                if (finger.id > other.id and note.pitch < other.current_pitch) or (finger.id < other.id and note.pitch > other.current_pitch):
+                    crossover_cost = self.CROSSOVER_PENALTY; break
+        return travel_cost + recency_cost + thumb_cost + stretch_cost + crossover_cost
+    def _assign_single_note(self, note: Note):
+        costs = [(self._calculate_cost(f, note), f) for f in self.fingers]
+        _, best_finger = min(costs, key=lambda x: x[0])
+        note.hand = best_finger.hand; self._update_finger_state(best_finger, note)
+    def _assign_chord(self, chord_notes: List[Note]):
+        chord_notes.sort(key=lambda n: n.pitch)
+        span = chord_notes[-1].pitch - chord_notes[0].pitch
+        if span > self.MAX_HAND_SPAN:
+            best_gap, split_index = -1, -1
+            for i in range(len(chord_notes) - 1):
+                gap = chord_notes[i+1].pitch - chord_notes[i].pitch
+                if gap > best_gap: best_gap, split_index = gap, i + 1
+            for i, note in enumerate(chord_notes): note.hand = 'left' if i < split_index else 'right'
+        else:
+            left_fingers = [f for f in self.fingers if f.hand == 'left' and f.current_pitch is not None]
+            right_fingers = [f for f in self.fingers if f.hand == 'right' and f.current_pitch is not None]
+            left_center = np.mean([f.current_pitch for f in left_fingers]) if left_fingers else 48
+            right_center = np.mean([f.current_pitch for f in right_fingers]) if right_fingers else 72
+            chord_center = np.mean([n.pitch for n in chord_notes])
+            chosen_hand = 'left' if abs(chord_center - left_center) <= abs(chord_center - right_center) else 'right'
+            for note in chord_notes: note.hand = chosen_hand
+        for note in chord_notes:
+            hand_fingers = [f for f in self.fingers if f.hand == note.hand]
+            for f in hand_fingers: f.last_press_time = note.start_time
+            closest_finger = min(hand_fingers, key=lambda f: abs(f.current_pitch - note.pitch) if f.current_pitch else float('inf'))
+            closest_finger.current_pitch = note.pitch
+
+class PedalGenerator:
+    @staticmethod
+    def _apply_clarity_legato(events: List[KeyEvent], time_groups: List[List[Note]]):
+        for i in range(len(time_groups)):
+            press_time = time_groups[i][0].start_time
+            release_time = time_groups[i+1][0].start_time if i < len(time_groups) - 1 else max(n.start_time + n.duration for n in time_groups[i])
+            if release_time > press_time:
+                events.append(KeyEvent(press_time, 1, 'pedal', 'down')); events.append(KeyEvent(release_time, 3, 'pedal', 'up'))
+    @staticmethod
+    def _apply_accent_pedal(events: List[KeyEvent], time_groups: List[List[Note]]):
+        for group in time_groups:
+            press_time = group[0].start_time; release_time = max(n.start_time + n.duration for n in group)
+            if release_time > press_time:
+                events.append(KeyEvent(press_time, 1, 'pedal', 'down')); events.append(KeyEvent(release_time, 3, 'pedal', 'up'))
+    @staticmethod
+    def _apply_bridge_pedal(events: List[KeyEvent], time_groups: List[List[Note]]):
+        if not time_groups: return
+        press_time = time_groups[0][0].start_time; release_time = max(n.start_time + n.duration for n in time_groups[-1])
+        if release_time > press_time:
+            events.append(KeyEvent(press_time, 1, 'pedal', 'down')); events.append(KeyEvent(release_time, 3, 'pedal', 'up'))
+    @staticmethod
+    def generate_events(config: Dict, final_notes: List[Note], sections: List[MusicalSection]) -> List[KeyEvent]:
+        style = config.get('pedal_style')
+        if style == 'none' or not final_notes: return []
+        events = []
+        for sec in sections:
+            if sec.is_bridge:
+                sec_final_notes = [n for n in final_notes if sec.start_time <= n.start_time < sec.end_time]
+                PedalGenerator._apply_bridge_pedal(events, get_time_groups(sec_final_notes)); continue
+            for phrase in sec.rhythmic_phrases:
+                phrase_final_notes = [n for n in final_notes if phrase.start_time <= n.start_time < phrase.end_time]
+                phrase_time_groups = get_time_groups(phrase_final_notes);
+                if not phrase_time_groups: continue
+                if phrase.pattern_label == 'arpeggio': PedalGenerator._apply_bridge_pedal(events, phrase_time_groups); continue
+                elif phrase.pattern_label in ['scale', 'ornament']: continue
+                if style == 'hybrid':
+                    if phrase.articulation_label in ['staccato', 'staccatissimo', 'tenuto']: PedalGenerator._apply_accent_pedal(events, phrase_time_groups)
+                    else: PedalGenerator._apply_clarity_legato(events, phrase_time_groups)
+                elif style == 'legato':
+                    if phrase.articulation_label in ['legato', 'tenuto', 'uniform']: PedalGenerator._apply_clarity_legato(events, phrase_time_groups)
+                elif style == 'rhythmic':
+                    if phrase.articulation_label in ['staccato', 'staccatissimo', 'tenuto']: PedalGenerator._apply_accent_pedal(events, phrase_time_groups)
+        return events
+
+class SectionAnalyzer:
+    ARTICULATION_LABELS = { 1: ['uniform'], 2: ['legato', 'staccato'], 3: ['legato', 'tenuto', 'staccato'], 4: ['legato', 'tenuto', 'staccato', 'staccatissimo'] }
+    def __init__(self, notes: List[Note], tempo_map: TempoMap):
+        self.notes, self.tempo_map = notes, tempo_map; self.time_groups = get_time_groups(notes)
+    def analyze(self) -> List[MusicalSection]:
+        if not self.time_groups: return []
+        phrase_boundaries = self._plan_phrases_with_bridges();
+        if not phrase_boundaries: return []
+        initial_phrases = self._create_sections_from_boundaries(phrase_boundaries)
+        merged_sections = self._merge_similar_sections(initial_phrases)
+        classified_sections = self._classify_sections_by_pace(merged_sections)
+        for section in classified_sections:
+            if section.is_bridge: self._finalize_rhythmic_phrase(section, get_time_groups(section.notes), 'bridge_held', 'standard'); continue
+            self._subdivide_section_by_articulation(section)
+        return classified_sections
+    def _check_for_bridge(self, group1: List[Note], group2: List[Note]) -> bool:
+        gap_start = max(n.start_time + n.duration for n in group1); gap_end = group2[0].start_time; gap_duration = gap_end - gap_start
+        if gap_duration <= 0.1: return False
+        tempo = self.tempo_map.get_tempo_at(gap_start); beat_duration = tempo / 1_000_000.0
+        normalized_gap = gap_duration / beat_duration if beat_duration > 0 else 0
+        if not (0 < normalized_gap < 1.5): return False
+        hand1 = max(set(n.hand for n in group1), key=list(n.hand for n in group1).count); hand2 = max(set(n.hand for n in group2), key=list(n.hand for n in group2).count)
+        if hand1 != hand2: return False
+        avg_pitch1 = np.mean([n.pitch for n in group1]); avg_pitch2 = np.mean([n.pitch for n in group2])
+        if abs(avg_pitch1 - avg_pitch2) >= 12: return False
+        return True
+    def _plan_phrases_with_bridges(self) -> List[Tuple[int, int, bool]]:
+        plan = [];
+        if not self.time_groups: return plan
+        current_phrase_start_index, i = 0, 0
+        while i < len(self.time_groups) - 1:
+            is_bridge = self._check_for_bridge(self.time_groups[i], self.time_groups[i+1])
+            if not is_bridge: plan.append((current_phrase_start_index, i, False)); current_phrase_start_index = i + 1
+            i += 1
+        plan.append((current_phrase_start_index, len(self.time_groups) - 1, False))
+        return plan
+    def _create_sections_from_boundaries(self, boundaries: List[Tuple[int, int, bool]]) -> List[MusicalSection]:
+        sections = []
+        for start_idx, end_idx, is_bridge in boundaries:
+            section_notes = [note for i in range(start_idx, end_idx + 1) for note in self.time_groups[i]]
+            if not section_notes: continue
+            start_time, end_time = self.time_groups[start_idx][0].start_time, max(n.start_time + n.duration for n in self.time_groups[end_idx])
+            note_count, musical_beats = len(section_notes), self._calculate_musical_beats(start_time, end_time, self.tempo_map)
+            normalized_density = note_count / musical_beats if musical_beats > 0 else 0
+            section = MusicalSection(start_time, end_time, note_count, section_notes, normalized_density, is_bridge=is_bridge)
+            sections.append(section)
+        return sections
+    def _merge_similar_sections(self, sections: List[MusicalSection], similarity_threshold: float = 0.35) -> List[MusicalSection]:
+        if not sections: return []
+        merged, current_section = [], copy.deepcopy(sections[0])
+        for next_section in sections[1:]:
+            if current_section.is_bridge or next_section.is_bridge: merged.append(current_section); current_section = copy.deepcopy(next_section); continue
+            density_diff = abs(next_section.normalized_density - current_section.normalized_density)
+            if density_diff / max(current_section.normalized_density, 1e-6) < similarity_threshold:
+                current_section.end_time = next_section.end_time; current_section.notes.extend(next_section.notes)
+                current_section.note_count = len(current_section.notes)
+                musical_beats = self._calculate_musical_beats(current_section.start_time, current_section.end_time, self.tempo_map)
+                current_section.normalized_density = current_section.note_count / musical_beats if musical_beats > 0 else 0
+            else: merged.append(current_section); current_section = copy.deepcopy(next_section)
+        merged.append(current_section)
+        return merged
+    def _classify_sections_by_pace(self, sections: List[MusicalSection]) -> List[MusicalSection]:
+        if not sections or len(sections) < 3:
+            for section in sections: section.pace_label = 'normal'
+            return sections
+        densities = [s.normalized_density for s in sections]; slow_q, fast_q = np.percentile(densities, [33, 67])
+        for section in sections:
+            if section.normalized_density <= slow_q: section.pace_label = 'slow'
+            elif section.normalized_density >= fast_q: section.pace_label = 'fast'
+            else: section.pace_label = 'normal'
+        return sections
+    def _subdivide_section_by_articulation(self, section: MusicalSection):
+        time_groups = get_time_groups(section.notes)
+        if len(time_groups) < 3: self._finalize_rhythmic_phrase(section, time_groups, 'uniform', self._detect_pattern(section.notes)); return
+        inter_chord_gaps = []
+        for i in range(len(time_groups) - 1):
+            gap_start = max(n.start_time + n.duration for n in time_groups[i]); gap_end = time_groups[i+1][0].start_time
+            tempo = self.tempo_map.get_tempo_at(gap_start); beat_duration = tempo / 1_000_000.0
+            normalized_gap = (gap_end - gap_start) / beat_duration if beat_duration > 0 else 0
+            inter_chord_gaps.append(max(0, normalized_gap))
+        gap_data = np.array(inter_chord_gaps).reshape(-1, 1)
+        inertias, max_k = [], min(len(np.unique(gap_data)), 4)
+        if max_k < 2: self._finalize_rhythmic_phrase(section, time_groups, 'uniform', self._detect_pattern(section.notes)); return
+        for k in range(1, max_k + 1):
+            kmeans = KMeans(n_clusters=k, n_init='auto', random_state=0).fit(gap_data); inertias.append(kmeans.inertia_)
+        optimal_k = 1
+        if len(inertias) > 1:
+            diffs = np.diff(inertias)
+            if len(diffs) > 1: optimal_k = np.argmax(np.diff(diffs)) + 2
+            else: optimal_k = 2
+        kmeans = KMeans(n_clusters=optimal_k, n_init='auto', random_state=0).fit(gap_data)
+        sorted_indices = np.argsort(kmeans.cluster_centers_.flatten())
+        labels_for_k = self.ARTICULATION_LABELS.get(optimal_k, self.ARTICULATION_LABELS[4])
+        label_map = {idx: label for idx, label in zip(sorted_indices, labels_for_k)}
+        gap_labels = [label_map[label] for label in kmeans.labels_]
+        current_phrase_groups, current_label = [time_groups[0]], gap_labels[0]
+        for i, label in enumerate(gap_labels):
+            if label == current_label: current_phrase_groups.append(time_groups[i+1])
+            else:
+                phrase_notes = [n for g in current_phrase_groups for n in g]
+                self._finalize_rhythmic_phrase(section, current_phrase_groups, current_label, self._detect_pattern(phrase_notes))
+                current_phrase_groups, current_label = [time_groups[i+1]], label
+        phrase_notes = [n for g in current_phrase_groups for n in g]
+        self._finalize_rhythmic_phrase(section, current_phrase_groups, current_label, self._detect_pattern(phrase_notes))
+    @staticmethod
+    def _finalize_rhythmic_phrase(section: MusicalSection, phrase_groups: List[List[Note]], articulation: str, pattern: str):
+        if not phrase_groups: return
+        start_time, end_time = phrase_groups[0][0].start_time, max(n.start_time + n.duration for n in phrase_groups[-1])
+        notes = [note for group in phrase_groups for note in group]
+        section.rhythmic_phrases.append(RhythmicPhrase(start_time, end_time, notes, articulation, pattern))
+    @staticmethod
+    def _calculate_musical_beats(start_time: float, end_time: float, tempo_map: TempoMap) -> float:
+        if start_time >= end_time: return 0.0
+        total_beats = 0.0
+        change_points = [event_time for event_time, _ in tempo_map.events if start_time < event_time < end_time]
+        all_points = sorted(list(set([start_time] + change_points + [end_time])))
+        for i in range(len(all_points) - 1):
+            seg_start, seg_end = all_points[i], all_points[i+1]; seg_duration = seg_end - seg_start
+            tempo = tempo_map.get_tempo_at(seg_start); beat_duration = tempo / 1_000_000.0
+            if beat_duration > 0: total_beats += seg_duration / beat_duration
+        return total_beats
+    @staticmethod
+    def _detect_pattern(phrase_notes: List[Note]) -> str:
+        note_count = len(phrase_notes);
+        if note_count < 4: return 'standard'
+        pitch_classes, pitches = {n.pitch % 12 for n in phrase_notes}, [n.pitch for n in phrase_notes]
+        if len(pitch_classes) <= 4:
+            root = min(pitch_classes); intervals = sorted([(p - root) % 12 for p in pitch_classes])
+            if set(intervals).issubset({0, 4, 7, 11}) or set(intervals).issubset({0, 3, 7, 10}): return 'arpeggio'
+        deltas = np.abs(np.diff(pitches))
+        if len(deltas) > 0 and np.sum((deltas > 0) & (deltas <= 2)) / len(deltas) > 0.8: return 'scale'
+        duration = phrase_notes[-1].start_time - phrase_notes[0].start_time
+        if duration > 0 and note_count / duration > 15 and len(set(pitches)) <= 3: return 'ornament'
+        return 'standard'
+
+# =====================================================================================
+# ==                                                                                 ==
+# ==           SECTION 2: FUNCTIONAL PLAYER LOGIC (INTEGRATED & ADAPTED)             ==
+# ==                                                                                 ==
+# =====================================================================================
+
+class Player(QObject):
+    status_updated = Signal(str)
+    progress_updated = Signal(int)
+    playback_finished = Signal()
+
+    def __init__(self, config: Dict):
+        super().__init__()
+        self.config = config
+        self.keyboard = Controller()
+        self.parser = MidiParser()
+        self.mapper = KeyMapper()
+        self.humanizer = Humanizer(config)
+        self.pedal_generator = PedalGenerator()
+        self.event_queue: List[KeyEvent] = []
+        self.stop_event = threading.Event()
+        self.key_states: Dict[str, KeyState] = {}
+        self.pedal_is_down = False
+        self.tempo_map = None
+
+    def play(self):
+        try:
+            original_notes, sections = self._initialize_and_analyze()
+            if not original_notes:
+                self.status_updated.emit("Error: No playable notes found in the file.")
+                self.playback_finished.emit()
+                return
+
+            humanized_notes = copy.deepcopy(original_notes)
+            left_hand_notes = [n for n in humanized_notes if n.hand == 'left']
+            right_hand_notes = [n for n in humanized_notes if n.hand == 'right']
+            resync_points = {round(n.start_time, 2) for n in left_hand_notes}.intersection({round(n.start_time, 2) for n in right_hand_notes})
+
+            self.humanizer.apply_to_hand(left_hand_notes, 'left', resync_points)
+            self.humanizer.apply_to_hand(right_hand_notes, 'right', resync_points)
+            
+            all_notes = sorted(left_hand_notes + right_hand_notes, key=lambda n: n.start_time)
+            
+            self.humanizer.apply_tempo_rubato(all_notes, sections)
+            
+            if self.config.get('debug_mode'):
+                self.status_updated.emit(self._generate_debug_report(original_notes, all_notes, sections))
+
+            self._schedule_events(all_notes, sections)
+
+            if self.config.get('debug_mode'):
+                 self.status_updated.emit(self._get_event_queue_report())
+
+            if self.config.get('countdown'): self._run_countdown()
+            if self.stop_event.is_set():
+                self.playback_finished.emit()
+                return
+
+            self.status_updated.emit("Playback starting...")
+            self._run_scheduler()
+
+        except (IOError, ValueError) as e:
+            self.status_updated.emit(f"Error: {e}")
+        except Exception as e:
+            self.status_updated.emit(f"An unexpected error occurred: {e}")
+        finally:
+            if not self.stop_event.is_set():
+                self.shutdown()
+            self.playback_finished.emit()
+
+    def stop(self):
+        if not self.stop_event.is_set():
+            self.status_updated.emit("Stopping playback...")
+            self.stop_event.set()
+            self.shutdown()
+
+    def _initialize_and_analyze(self) -> Tuple[Optional[List[Note]], Optional[List[MusicalSection]]]:
+        self.status_updated.emit(f"Loading '{self.config.get('midi_file')}'...")
+        tempo_scale = self.config.get('tempo') / 100.0
+        original_notes, tempo_data = self.parser.parse(self.config.get('midi_file'), tempo_scale)
+        if not original_notes: return None, None
+
+        if self.config.get('piano_only'):
+            self.status_updated.emit("Using advanced piano fingering model for hand assignment.")
+            engine = FingeringEngine()
+            engine.assign_hands(original_notes)
+        else:
+            self.status_updated.emit("Using simple pitch-split for hand assignment.")
+            self._separate_hands_by_pitch(original_notes)
+
+        self.tempo_map = TempoMap(tempo_data)
+        duration = max(n.start_time + n.duration for n in original_notes) if original_notes else 0
+        self.status_updated.emit(f"Loaded {len(original_notes)} notes. Estimated duration: {duration:.2f}s")
+
+        self.status_updated.emit("Analyzing musical structure...")
+        analyzer = SectionAnalyzer(original_notes, self.tempo_map)
+        sections = analyzer.analyze()
+        self.status_updated.emit(f"Analysis complete. Found {len(sections)} major sections.")
+
+        return original_notes, sections
+
+    def _generate_debug_report(self, original_notes, humanized_notes, sections) -> str:
+        report = ["\n\n--- MIDI2Key Debug Report ---"]
+        
+        report.append("\n[1. Playback Configuration]")
+        for key, val in self.config.items():
+            report.append(f"  - {key}: {val}")
+
+        report.append("\n[2. Initial Analysis Summary]")
+        report.append(f"  - Total Notes Parsed: {len(original_notes)}")
+        report.append(f"  - Sections Found: {len(sections)}")
+        for i, sec in enumerate(sections):
+            report.append(f"    - Section {i+1} ({sec.start_time:.3f}s - {sec.end_time:.3f}s): pace = {sec.pace_label}")
+
+        report.append("\n[3. Detailed Section & Phrase Analysis]")
+        for i, sec in enumerate(sections):
+            report.append(f"  - SECTION {i+1} ({sec.start_time:.3f}s - {sec.end_time:.3f}s) | Pace: {sec.pace_label}")
+            for j, phrase in enumerate(sec.rhythmic_phrases):
+                report.append(f"    > Phrase {j+1} ({phrase.start_time:.3f}s - {phrase.end_time:.3f}s) | Artic: {phrase.articulation_label}, Pattern: {phrase.pattern_label}")
+        
+        report.append("\n[4. Note Transformation Log]")
+        original_notes_by_id = {n.id: n for n in original_notes}
+        for final_note in humanized_notes:
+            original_note = original_notes_by_id.get(final_note.id)
+            if original_note:
+                time_delta = final_note.start_time - original_note.start_time
+                dur_delta = final_note.duration - original_note.duration
+                report.append(
+                    f"  - Note {final_note.id:<4} ({self.mapper.pitch_to_name(final_note.pitch):<4}): "
+                    f"Time: {original_note.start_time:7.3f}s -> {final_note.start_time:7.3f}s ({time_delta:+.3f}s) | "
+                    f"Dur: {original_note.duration:6.3f}s -> {final_note.duration:6.3f}s ({dur_delta:+.3f}s)"
+                )
+
+        return "\n".join(report)
+    
+    def _get_event_queue_report(self) -> str:
+        report = ["\n[5. Final Event Queue]"]
+        temp_queue = sorted(list(self.event_queue))
+        for event in temp_queue:
+            report.append(f"  - Time: {event.time:7.3f}s | Prio: {event.priority} | Action: {event.action:<7} | Key: '{event.key_char}'")
+        return "\n".join(report)
+
+    def _separate_hands_by_pitch(self, notes: List[Note], split_point: int = 60):
+        for note in notes: note.hand = 'left' if note.pitch < split_point else 'right'
+
+    def _run_countdown(self):
+        self.status_updated.emit("Get ready...")
+        for i in range(3, 0, -1):
+            if self.stop_event.is_set(): return
+            self.status_updated.emit(f"{i}...")
+            time.sleep(1)
+        self.status_updated.emit("Playing!")
+
+    def _schedule_events(self, notes_to_play: List[Note], sections: List[MusicalSection]):
+        self.key_states.clear()
+        
+        use_mistakes = self.config.get('enable_mistakes', False)
+        mistake_chance = self.config.get('mistake_chance', 0) / 100.0
+        
+        played_pitches_in_section = set()
+        current_section_idx = -1
+
+        for note in notes_to_play:
+            note_section_idx = -1
+            for i, sec in enumerate(sections):
+                if sec.start_time <= note.start_time < sec.end_time:
+                    note_section_idx = i
+                    break
+            
+            if note_section_idx != current_section_idx:
+                played_pitches_in_section.clear()
+                current_section_idx = note_section_idx
+
+            mistake_scheduled = False
+            is_eligible_for_mistake = note.pitch not in played_pitches_in_section
+            make_mistake = use_mistakes and is_eligible_for_mistake and (random.random() < mistake_chance)
+            
+            if make_mistake:
+                mistake_duration = random.uniform(0.030, 0.060)
+                mistake_pitch = self._get_mistake_pitch(note.pitch)
+                
+                if mistake_pitch is not None:
+                    mistake_key = self.mapper.get_key_for_pitch(mistake_pitch)
+                    correct_key = self.mapper.get_key_for_pitch(note.pitch)
+
+                    if mistake_key and correct_key:
+                        if note.duration > mistake_duration: # Slip-and-correct mistake
+                            heapq.heappush(self.event_queue, KeyEvent(note.start_time, 2, 'press', mistake_key))
+                            heapq.heappush(self.event_queue, KeyEvent(note.start_time + mistake_duration, 4, 'release', mistake_key))
+                            correct_start = note.start_time + mistake_duration
+                            correct_duration = note.duration - mistake_duration
+                            heapq.heappush(self.event_queue, KeyEvent(correct_start, 2, 'press', correct_key))
+                            heapq.heappush(self.event_queue, KeyEvent(correct_start + correct_duration, 4, 'release', correct_key))
+                        else: # "Fatal" mistake for short notes
+                            heapq.heappush(self.event_queue, KeyEvent(note.start_time, 2, 'press', mistake_key))
+                            heapq.heappush(self.event_queue, KeyEvent(note.start_time + note.duration, 4, 'release', mistake_key))
+                        
+                        if correct_key not in self.key_states: self.key_states[correct_key] = KeyState(correct_key)
+                        if mistake_key not in self.key_states: self.key_states[mistake_key] = KeyState(mistake_key)
+                        mistake_scheduled = True
+
+            if not mistake_scheduled:
+                key_char = self.mapper.get_key_for_pitch(note.pitch)
+                if key_char:
+                    heapq.heappush(self.event_queue, KeyEvent(note.start_time, 2, 'press', key_char))
+                    heapq.heappush(self.event_queue, KeyEvent(note.start_time + note.duration, 4, 'release', key_char))
+                    if key_char not in self.key_states:
+                        self.key_states[key_char] = KeyState(key_char)
+            
+            played_pitches_in_section.add(note.pitch)
+
+        pedal_events = self.pedal_generator.generate_events(self.config, notes_to_play, sections)
+        for event in pedal_events:
+            heapq.heappush(self.event_queue, event)
+            
+    def _get_mistake_pitch(self, original_pitch: int) -> Optional[int]:
+        is_black = KeyMapper.is_black_key(original_pitch)
+        
+        if is_black:
+            possible_offsets = [-2, -1, 1, 2]
+            offset = random.choice(possible_offsets)
+            return original_pitch + offset
+        else:
+            valid_neighbors = []
+            for offset in [-2, -1, 1, 2]:
+                neighbor_pitch = original_pitch + offset
+                if not KeyMapper.is_black_key(neighbor_pitch):
+                    valid_neighbors.append(neighbor_pitch)
+            
+            if valid_neighbors:
+                return random.choice(valid_neighbors)
+        return None
+
+
+    def _run_scheduler(self):
+        if not self.event_queue: return
+        start_time = time.perf_counter()
+        total_duration = max(e.time for e in self.event_queue) if self.event_queue else 0
+
+        while not self.stop_event.is_set() and self.event_queue:
+            playback_time = time.perf_counter() - start_time
+            if self.event_queue[0].time <= playback_time:
+                event = heapq.heappop(self.event_queue)
+                self._execute_key_event(event)
+            else:
+                time.sleep(0.001)
+            
+            if total_duration > 0:
+                progress = int((playback_time / total_duration) * 100)
+                self.progress_updated.emit(progress)
+
+    def _physical_press(self, modifiers: List[Key], base_key: str):
+        if Key.shift in modifiers:
+            with self.keyboard.pressed(Key.shift): self.keyboard.press(base_key)
+        else: self.keyboard.press(base_key)
+
+    def _execute_key_event(self, event: KeyEvent):
+        if self.stop_event.is_set(): return
+        if event.action == 'pedal':
+            self._handle_pedal_event(event)
+            return
+        key_char = event.key_char
+        state = self.key_states.get(key_char)
+        if not state: return
+        modifiers, base_key = self.mapper.get_key_press_info(key_char)
+        try:
+            if event.action == 'press':
+                was_physically_down = state.is_physically_down
+                is_sustained_only = state.is_sustained and not state.is_active
+                state.press()
+                if is_sustained_only:
+                    self.keyboard.release(base_key)
+                    self._physical_press(modifiers, base_key)
+                elif not was_physically_down:
+                    self._physical_press(modifiers, base_key)
+            elif event.action == 'release':
+                was_physically_down = state.is_physically_down
+                state.release(self.pedal_is_down)
+                if was_physically_down and not state.is_physically_down:
+                    self.keyboard.release(base_key)
+        except Exception: pass
+
+    def _handle_pedal_event(self, event: KeyEvent):
+        if self.stop_event.is_set(): return
+        if event.key_char == 'down' and not self.pedal_is_down:
+            self.pedal_is_down = True
+            try: self.keyboard.press(Key.space)
+            except Exception: pass
+        elif event.key_char == 'up' and self.pedal_is_down:
+            self.pedal_is_down = False
+            try: self.keyboard.release(Key.space)
+            except Exception: pass
+            for key_char, state in self.key_states.items():
+                was_physically_down = state.is_physically_down
+                state.lift_sustain()
+                if was_physically_down and not state.is_physically_down:
+                    try:
+                        _, base_key = self.mapper.get_key_press_info(key_char)
+                        self.keyboard.release(base_key)
+                    except Exception: pass
+
+    def shutdown(self):
+        self.status_updated.emit("Releasing all keys...")
+        for key_char, state in list(self.key_states.items()):
+            if state.is_physically_down:
+                try:
+                    _, base_key = self.mapper.get_key_press_info(key_char)
+                    self.keyboard.release(base_key)
+                except Exception: pass
+        self.key_states.clear()
+        if self.pedal_is_down:
+            try: self.keyboard.release(Key.space)
+            except Exception: pass
+        for key in [Key.shift, Key.ctrl, Key.alt]:
+            try: self.keyboard.release(key)
+            except Exception: pass
+        self.status_updated.emit("Shutdown complete.")
+
+
+# =====================================================================================
+# ==                                                                                 ==
+# ==                       SECTION 3: PyQt6 GUI (FINAL VERSION)                      ==
+# ==                                                                                 ==
+# =====================================================================================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MIDI2Key")
+        self.setMinimumWidth(550)
+        self.player_thread = None
+        self.player = None
+        self.humanization_sub_checkboxes = []
+        self.humanization_sliders = []
+        self.humanization_spinboxes = []
+        if getattr(sys, 'frozen', False):
+            base_path = sys._MEIPASS
+        else:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+        
+        icon_path = os.path.join(base_path, 'icon.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+        else:
+            print(f"Warning: Icon file not found at {icon_path}")  
+        self._setup_ui()
+        self.adjustSize()
+
+    def _setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(10, 10, 10, 5)
+
+        tabs = QTabWidget()
+        main_layout.addWidget(tabs)
+        controls_tab, log_tab = QWidget(), QWidget()
+        tabs.addTab(controls_tab, "Playback Controls")
+        tabs.addTab(log_tab, "Log Output")
+
+        controls_layout = QVBoxLayout(controls_tab)
+        controls_layout.addWidget(self._create_file_group())
+        controls_layout.addWidget(self._create_playback_group())
+        controls_layout.addWidget(self._create_humanization_group())
+        controls_layout.addStretch()
+
+        button_layout = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.stop_button = QPushButton("Stop")
+        self.reset_button = QPushButton("Reset to Defaults")
+        button_layout.addWidget(self.play_button)
+        button_layout.addWidget(self.stop_button)
+        button_layout.addStretch()
+        button_layout.addWidget(self.reset_button)
+        main_layout.addLayout(button_layout)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        main_layout.addWidget(self.progress_bar)
+
+        self.play_button.clicked.connect(self.handle_play)
+        self.stop_button.clicked.connect(self.handle_stop)
+        self.reset_button.clicked.connect(self._reset_controls_to_default)
+
+        log_layout = QVBoxLayout(log_tab)
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setFont(QFont("Courier", 9))
+        log_layout.addWidget(self.log_output)
+
+        self.stop_button.setEnabled(False)
+
+    def _create_info_icon(self, tooltip_text: str) -> QLabel:
+        label = QLabel("\u24D8")
+        label.setStyleSheet("color: gray; font-weight: bold;")
+        label.setToolTip(tooltip_text)
+        return label
+
+    def _create_slider_and_spinbox(self, min_val, max_val, default_val, text_suffix="", factor=10000.0, decimals=4):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(min_val * factor), int(max_val * factor))
+        
+        spinbox = QDoubleSpinBox()
+        spinbox.setDecimals(decimals)
+        spinbox.setRange(0.0, 9999.9999) # Set a high upper bound for manual entry
+        spinbox.setSingleStep(1.0 / factor)
+        
+        spinbox.setSuffix(text_suffix)
+        slider.setValue(int(default_val * factor))
+        spinbox.setValue(default_val)
+        
+        def slider_to_spinbox(value):
+            spinbox.blockSignals(True)
+            spinbox.setValue(value / factor)
+            spinbox.blockSignals(False)
+
+        def spinbox_to_slider(value):
+            slider.blockSignals(True)
+            slider.setValue(int(value * factor))
+            slider.blockSignals(False)
+
+        slider.valueChanged.connect(slider_to_spinbox)
+        spinbox.valueChanged.connect(spinbox_to_slider)
+        return slider, spinbox
+
+    def _create_file_group(self):
+        group = QGroupBox("MIDI File")
+        layout = QVBoxLayout(group)
+        self.file_path_label = QLabel("No file selected.")
+        self.file_path_label.setStyleSheet("font-style: italic; color: grey;")
+        browse_button = QPushButton("Browse for MIDI File")
+        browse_button.clicked.connect(self.select_file)
+        layout.addWidget(self.file_path_label)
+        layout.addWidget(browse_button)
+        return group
+
+    def _create_playback_group(self):
+        group = QGroupBox("Playback Settings")
+        grid = QGridLayout(group)
+
+        tempo_label = QLabel("Tempo:")
+        tempo_info = self._create_info_icon("Adjusts the overall playback speed as a percentage of the original.\nExample: 120% plays the piece 20% faster, while 50% plays it at half speed.")
+        tempo_slider, self.tempo_spinbox = self._create_slider_and_spinbox(0.1, 200.0, 100.0, "%", factor=100.0, decimals=1)
+        grid.addWidget(tempo_label, 0, 0); grid.addWidget(tempo_info, 0, 1)
+        grid.addWidget(tempo_slider, 0, 2); grid.addWidget(self.tempo_spinbox, 0, 3)
+
+        pedal_label = QLabel("Pedal Style:")
+        pedal_info = self._create_info_icon("Controls how the sustain pedal (spacebar) is automatically used.\n\n- Hybrid: Balances clarity and connection (recommended).\n- Legato: Connects notes smoothly, ideal for lyrical music.\n- Rhythmic: Emphasizes rhythmic patterns by pedaling on accented notes.\n- None: Disables automatic pedaling.")
+        self.pedal_style_combo = QComboBox()
+        self.pedal_style_combo.addItems(['hybrid', 'legato', 'rhythmic', 'none'])
+        grid.addWidget(pedal_label, 1, 0); grid.addWidget(pedal_info, 1, 1)
+        grid.addWidget(self.pedal_style_combo, 1, 2, 1, 2)
+
+        self.piano_only_check = QCheckBox("Piano Only")
+        self.piano_only_check.setToolTip("Use this for solo piano pieces. A sophisticated algorithm will attempt to assign notes\nto the left and right hands. If unchecked, a simple pitch split is used.")
+        warning_label = QLabel("Limits to 10 notes played at once.")
+        warning_label.setStyleSheet("color: #b8860b; font-style: italic;")
+        warning_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.piano_only_check, 2, 0, 1, 2)
+        grid.addWidget(warning_label, 2, 2, 1, 2)
+
+        self.countdown_check = QCheckBox("Enable 3-second countdown")
+        self.debug_check = QCheckBox("Enable debug output")
+        grid.addWidget(self.countdown_check, 3, 0, 1, 4)
+        grid.addWidget(self.debug_check, 4, 0, 1, 4)
+
+        grid.setColumnStretch(2, 1)
+        self._reset_playback_group_to_default()
+        return group
+
+    def _create_humanization_group(self):
+        group = QGroupBox("Humanization Controls")
+        grid = QGridLayout(group)
+        self.humanization_sub_checkboxes.clear(); self.humanization_sliders.clear(); self.humanization_spinboxes.clear()
+
+        self.select_all_humanization_check = QCheckBox("Select/Deselect All")
+        self.select_all_humanization_check.setStyleSheet("font-weight: bold;")
+        grid.addWidget(self.select_all_humanization_check, 0, 0, 1, 4)
+
+        def add_humanization_row(row_idx, label, tip, min_val, max_val, def_val, suffix, factor=1.0, decimals=3):
+            check = QCheckBox(label); info = self._create_info_icon(tip)
+            slider, spinbox = self._create_slider_and_spinbox(min_val, max_val, def_val, suffix, factor=factor, decimals=decimals)
+            grid.addWidget(check, row_idx, 0); grid.addWidget(info, row_idx, 1);
+            grid.addWidget(slider, row_idx, 2); grid.addWidget(spinbox, row_idx, 3)
+            check.toggled.connect(slider.setEnabled); check.toggled.connect(spinbox.setEnabled)
+            self.humanization_sub_checkboxes.append(check); self.humanization_sliders.append(slider); self.humanization_spinboxes.append(spinbox)
+            return check, spinbox
+
+        add_humanization_row(1, "Timing Variance:", "Randomly alters note start times to simulate human timing imperfections.\nExample: A value of 0.010s (10ms) means notes can play up to 10ms earlier or later than written.", 0, 0.1, 0.01, " s", factor=10000.0)
+        add_humanization_row(2, "Base Articulation:", "Sets the base length of every note as a percentage of its original duration.\nExample: 95% creates a slightly detached (staccato) feel, while 100% is fully connected (legato).", 50, 100, 95, "%", factor=100.0, decimals=1)
+        add_humanization_row(3, "Hand Drift Decay:", "Simulates the natural timing drift between left and right hands.\nThis value controls how quickly the hands 're-sync' at musical phrase boundaries.\nHigher values mean faster re-synchronization.", 0, 100, 25, "%", factor=100.0, decimals=1)
+        add_humanization_row(4, "Mistake Chance:", "Gives a percentage chance for a note to be 'mispressed' (a nearby note is played for a very\nshort duration) before the correct note sounds, simulating an accidental finger slip.", 0, 10, 0, "%", factor=100.0, decimals=1)
+        add_humanization_row(5, "Tempo Sway:", "Simulates expressive tempo changes (rubato) over musical phrases.\nThis value is the maximum time shift in seconds. The actual sway is randomized per phrase\nand is amplified in slow sections and reduced in fast sections.", 0, 0.1, 0, " s", factor=10000.0)
+
+        self.vary_velocity_check = QCheckBox("Vary note velocity")
+        velocity_info = self._create_info_icon("Randomly adjusts the velocity (how 'hard' a key is pressed) of each note, making the performance sound more dynamic and less robotic.")
+        grid.addWidget(self.vary_velocity_check, 6, 0); grid.addWidget(velocity_info, 6, 1)
+        self.humanization_sub_checkboxes.append(self.vary_velocity_check)
+
+        self.enable_chord_roll_check = QCheckBox("Enable chord rolling")
+        roll_info = self._create_info_icon("Simulates the 'rolling' of chords, where the notes are played in very quick succession from bottom to top instead of at the exact same moment.")
+        grid.addWidget(self.enable_chord_roll_check, 7, 0); grid.addWidget(roll_info, 7, 1)
+        self.humanization_sub_checkboxes.append(self.enable_chord_roll_check)
+
+        grid.setColumnStretch(2, 1)
+        self.select_all_humanization_check.toggled.connect(self._toggle_all_humanization)
+        for checkbox in self.humanization_sub_checkboxes: checkbox.toggled.connect(self._update_select_all_state)
+        self._reset_humanization_group_to_default()
+        return group
+
+    def _reset_controls_to_default(self):
+        self._reset_playback_group_to_default()
+        self._reset_humanization_group_to_default()
+        self.add_log_message("All settings have been reset to their default values.")
+
+    def _reset_playback_group_to_default(self):
+        self.tempo_spinbox.setValue(100); self.pedal_style_combo.setCurrentText('hybrid')
+        self.piano_only_check.setChecked(False); self.countdown_check.setChecked(True)
+        self.debug_check.setChecked(False)
+
+    def _reset_humanization_group_to_default(self):
+        self.humanization_spinboxes[0].setValue(0.010)
+        self.humanization_spinboxes[1].setValue(95.0)
+        self.humanization_spinboxes[2].setValue(25.0)
+        self.humanization_spinboxes[3].setValue(0.0)
+        self.humanization_spinboxes[4].setValue(0.0)
+        self.select_all_humanization_check.setChecked(False)
+
+    def _toggle_all_humanization(self, checked):
+        for checkbox in self.humanization_sub_checkboxes: checkbox.setChecked(checked)
+
+    def _update_select_all_state(self):
+        is_all_checked = all(c.isChecked() for c in self.humanization_sub_checkboxes)
+        self.select_all_humanization_check.blockSignals(True)
+        self.select_all_humanization_check.setChecked(is_all_checked)
+        self.select_all_humanization_check.blockSignals(False)
+
+    def select_file(self):
+        if self.player_thread and self.player_thread.isRunning(): return
+        filepath, _ = QFileDialog.getOpenFileName(self, "Select MIDI File", "", "MIDI Files (*.mid *.midi)")
+        if filepath:
+            self.file_path_label.setText(filepath.split('/')[-1])
+            self.file_path_label.setToolTip(filepath)
+            self.file_path_label.setStyleSheet("")
+            self.add_log_message(f"Selected file: {filepath}")
+
+    def add_log_message(self, message): self.log_output.append(message)
+    def update_progress(self, value): self.progress_bar.setValue(value)
+
+    def set_controls_enabled(self, enabled):
+        self.play_button.setEnabled(enabled); self.stop_button.setEnabled(not enabled)
+        self.reset_button.setEnabled(enabled)
+        for groupbox in self.findChildren(QGroupBox): groupbox.setEnabled(enabled)
+
+    def gather_config(self) -> Optional[Dict]:
+        filepath = self.file_path_label.toolTip()
+        if not filepath:
+            QMessageBox.warning(self, "No File", "Please select a MIDI file before playing."); return None
+        return {
+            'midi_file': filepath, 'tempo': self.tempo_spinbox.value(), 'countdown': self.countdown_check.isChecked(),
+            'piano_only': self.piano_only_check.isChecked(), 'pedal_style': self.pedal_style_combo.currentText(),
+            'debug_mode': self.debug_check.isChecked(),
+            'vary_timing': self.humanization_sub_checkboxes[0].isChecked(), 'timing_variance': self.humanization_spinboxes[0].value(),
+            'vary_articulation': self.humanization_sub_checkboxes[1].isChecked(), 'articulation': self.humanization_spinboxes[1].value() / 100.0,
+            'enable_drift_correction': self.humanization_sub_checkboxes[2].isChecked(), 'drift_decay_factor': self.humanization_spinboxes[2].value() / 100.0,
+            'enable_mistakes': self.humanization_sub_checkboxes[3].isChecked(), 'mistake_chance': self.humanization_spinboxes[3].value(),
+            'enable_tempo_sway': self.humanization_sub_checkboxes[4].isChecked(), 'tempo_sway_intensity': self.humanization_spinboxes[4].value(),
+            'vary_velocity': self.humanization_sub_checkboxes[5].isChecked(),
+            'enable_chord_roll': self.humanization_sub_checkboxes[6].isChecked(),
+        }
+
+    def handle_play(self):
+        if self.player_thread and self.player_thread.isRunning(): return
+        config = self.gather_config()
+        if not config: return
+        self.set_controls_enabled(False)
+        self.progress_bar.setValue(0)
+        self.add_log_message("="*50 + f"\nStarting playback...")
+        
+        self.player_thread = QThread()
+        self.player = Player(config)
+        self.player.moveToThread(self.player_thread)
+        self.player_thread.started.connect(self.player.play)
+        self.player.playback_finished.connect(self.on_playback_finished)
+        self.player.status_updated.connect(self.add_log_message)
+        self.player.progress_updated.connect(self.update_progress)
+        self.player_thread.start()
+
+    def handle_stop(self):
+        if self.player: self.player.stop()
+
+    def on_playback_finished(self):
+        self.add_log_message("Playback process finished.\n" + "="*50 + "\n")
+        self.set_controls_enabled(True)
+        if self.player_thread:
+            self.player_thread.quit()
+            self.player_thread.wait()
+        self.player = None
+        self.player_thread = None
+
+    def closeEvent(self, event):
+        if self.player and self.player_thread and self.player_thread.isRunning():
+            self.add_log_message("Window closed during playback. Forcing stop...")
+            self.player.stop()
+            self.player_thread.wait(1000)
+        event.accept()
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
