@@ -1,8 +1,7 @@
 # Ultimate-Humanised-MIDI-Player-for-ROBLOX, MIDI2Key
-translates .mid (midi) files to keystrokes, designed to work with ROBLOX pianos. Includes random "humanization" effects to imitate the human behind the instrument.
+Converts MIDI files to realistic, human-like keystrokes to be used for ROBLOX pianos. Includes humanization effects to imitate the human behind the instrument, with various pedal settings with automatically designated pedal time.
 
-
-<img width="326" height="396" alt="image" src="https://github.com/user-attachments/assets/0c25640d-548d-4925-bc1f-0f86c16e3e02"/>
+<img width="326" height="396" alt="MIDI2Key GUI for ROBLOX Piano" src="https://github.com/user-attachments/assets/0c25640d-548d-4925-bc1f-0f86c16e3e02"/>
 
 main.py will play the notes with duration, which will hold notes.
 noDuration.py, as you can tell from the name, will only press the note for a very short time.
