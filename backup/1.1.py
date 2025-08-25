@@ -15,18 +15,18 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import defaultdict
 import os
-import json
-from pathlib import Path
+from contextlib import ExitStack
+
+from PyQt6.QtGui import QIcon, QGuiApplication
 
 # --- GUI Dependencies ---
 try:
     from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                  QPushButton, QCheckBox, QSlider, QLabel, QFileDialog,
                                  QGroupBox, QFormLayout, QTabWidget, QTextEdit, QProgressBar,
-                                 QComboBox, QDoubleSpinBox, QMessageBox, QSpinBox, QGridLayout,
-                                 QFrame, QStatusBar)
+                                 QComboBox, QDoubleSpinBox, QMessageBox, QSpinBox, QGridLayout)
     from PyQt6.QtCore import QObject, QThread, pyqtSignal as Signal, Qt
-    from PyQt6.QtGui import QIcon, QGuiApplication, QFont
+    from PyQt6.QtGui import QFont
 except ImportError:
     print("PyQt6 not found. Please run 'pip install PyQt6' to run the GUI.")
     sys.exit(1)
@@ -41,9 +41,9 @@ except ImportError:
 
 
 # =====================================================================================
-# ==                                                                                ==
-# ==                       SECTION 1: CORE ENGINE & DATA STRUCTURES                   ==
-# ==                                                                                ==
+# ==                                                                                 ==
+# ==                       SECTION 1: CORE ENGINE & DATA STRUCTURES                  ==
+# ==                                                                                 ==
 # =====================================================================================
 
 @dataclass
@@ -316,16 +316,12 @@ class Humanizer:
             return
         self._log("Applying tempo rubato (sway)...")
         base_intensity = self.config.get('tempo_sway_intensity', 0.0)
-        invert_sway = self.config.get('invert_tempo_sway', False)
         note_map = {note.id: note for note in all_notes}
 
         for section in sections:
-            if section.pace_label == 'fast':
-                pace_multiplier = 1.5 if invert_sway else 0.25
-            elif section.pace_label == 'slow':
-                pace_multiplier = 0.25 if invert_sway else 1.5
-            else:
-                pace_multiplier = 1.0
+            if section.pace_label == 'fast': pace_multiplier = 0.25
+            elif section.pace_label == 'slow': pace_multiplier = 1.5
+            else: pace_multiplier = 1.0
 
             for phrase in section.rhythmic_phrases:
                 phrase_duration = phrase.end_time - phrase.start_time
@@ -371,8 +367,8 @@ class FingeringEngine:
         travel_cost = abs(finger.current_pitch - note.pitch) * self.TRAVEL_WEIGHT
         recency_cost = 0
         if finger.id in [f.id for f in self.fingers if f.last_press_time == finger.last_press_time]:
-              time_gap = note.start_time - finger.last_press_time
-              if 1e-6 < time_gap < 0.5: recency_cost = self.RECENCY_WEIGHT / time_gap
+             time_gap = note.start_time - finger.last_press_time
+             if 1e-6 < time_gap < 0.5: recency_cost = self.RECENCY_WEIGHT / time_gap
         thumb_cost = self.THUMB_ON_BLACK_KEY_PENALTY if finger.id in [0, 5] and KeyMapper.is_black_key(note.pitch) else 0
         stretch_cost, crossover_cost = 0, 0
         other_fingers_on_hand = [f for f in self.fingers if f.hand == finger.hand and f.id != finger.id and f.current_pitch is not None]
@@ -691,9 +687,9 @@ class SectionAnalyzer:
         return 'standard'
 
 # =====================================================================================
-# ==                                                                                ==
-# ==                 SECTION 2: FUNCTIONAL PLAYER LOGIC (INTEGRATED)                  ==
-# ==                                                                                ==
+# ==                                                                                 ==
+# ==           SECTION 2: FUNCTIONAL PLAYER LOGIC (INTEGRATED & ADAPTED)             ==
+# ==                                                                                 ==
 # =====================================================================================
 
 class Player(QObject):
@@ -1070,9 +1066,9 @@ class Player(QObject):
 
 
 # =====================================================================================
-# ==                                                                                ==
-# ==                       SECTION 3: PyQt6 GUI (FINAL VERSION)                       ==
-# ==                                                                                ==
+# ==                                                                                 ==
+# ==                       SECTION 3: PyQt6 GUI (FINAL VERSION)                      ==
+# ==                                                                                 ==
 # =====================================================================================
 
 class MainWindow(QMainWindow):
@@ -1082,12 +1078,9 @@ class MainWindow(QMainWindow):
         self.setMinimumWidth(550)
         self.player_thread = None
         self.player = None
-        
-        # --- Configuration File Setup ---
-        self.config_dir = Path.home() / ".midi2key"
-        self.config_path = self.config_dir / "config.json"
-        self.config_dir.mkdir(exist_ok=True)
-
+        self.humanization_sub_checkboxes = []
+        self.humanization_sliders = []
+        self.humanization_spinboxes = []
         if getattr(sys, 'frozen', False):
             base_path = sys._MEIPASS
         else:
@@ -1099,7 +1092,6 @@ class MainWindow(QMainWindow):
         else:
             print(f"Warning: Icon file not found at {icon_path}")  
         self._setup_ui()
-        self._load_config()
         self.adjustSize()
 
     def _setup_ui(self):
@@ -1108,16 +1100,11 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(10, 10, 10, 5)
 
-        # Define log_output early to prevent AttributeError during setup
-        self.log_output = QTextEdit()
-        self.log_output.setReadOnly(True)
-        self.log_output.setFont(QFont("Courier", 9))
-
         tabs = QTabWidget()
         main_layout.addWidget(tabs)
         controls_tab, log_tab = QWidget(), QWidget()
-        tabs.addTab(controls_tab, "Playback")
-        tabs.addTab(log_tab, "Debug")
+        tabs.addTab(controls_tab, "Playback Controls")
+        tabs.addTab(log_tab, "Log Output")
 
         controls_layout = QVBoxLayout(controls_tab)
         controls_layout.addWidget(self._create_file_group())
@@ -1138,12 +1125,6 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         main_layout.addWidget(self.progress_bar)
-        
-        status_bar = QStatusBar()
-        self.setStatusBar(status_bar)
-        status_bar.setSizeGripEnabled(False)
-        version_label = QLabel("v1.2")
-        status_bar.addPermanentWidget(version_label)
 
         self.play_button.clicked.connect(self.handle_play)
         self.stop_button.clicked.connect(self.handle_stop)
@@ -1151,6 +1132,9 @@ class MainWindow(QMainWindow):
 
         # --- Log Tab Setup ---
         log_layout = QVBoxLayout(log_tab)
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setFont(QFont("Courier", 9))
         log_layout.addWidget(self.log_output)
         
         log_button_layout = QHBoxLayout()
@@ -1163,10 +1147,11 @@ class MainWindow(QMainWindow):
         log_button_layout.addWidget(copy_log_button)
         log_layout.addLayout(log_button_layout)
 
+
         self.stop_button.setEnabled(False)
 
     def _create_info_icon(self, tooltip_text: str) -> QLabel:
-        label = QLabel("\u24D8") # Circled i
+        label = QLabel("\u24D8")
         label.setStyleSheet("color: gray; font-weight: bold;")
         label.setToolTip(tooltip_text)
         return label
@@ -1199,7 +1184,7 @@ class MainWindow(QMainWindow):
         return slider, spinbox
 
     def _create_file_group(self):
-        group = QGroupBox("MIDI")
+        group = QGroupBox("MIDI File")
         layout = QVBoxLayout(group)
         self.file_path_label = QLabel("No file selected.")
         self.file_path_label.setStyleSheet("font-style: italic; color: grey;")
@@ -1210,19 +1195,19 @@ class MainWindow(QMainWindow):
         return group
 
     def _create_playback_group(self):
-        group = QGroupBox("Playback")
+        group = QGroupBox("Playback Settings")
         grid = QGridLayout(group)
 
         # Row 0: Tempo
-        tempo_label = QLabel("Tempo")
-        tempo_info = self._create_info_icon("Controls the overall playback speed. 100% is the original speed, 120% is faster, 50% is half-speed.")
-        self.tempo_slider, self.tempo_spinbox = self._create_slider_and_spinbox(10.0, 200.0, 100.0, "%", factor=10.0, decimals=1)
+        tempo_label = QLabel("Tempo:")
+        tempo_info = self._create_info_icon("Adjusts the overall playback speed as a percentage of the original.\nExample: 120% plays the piece 20% faster, while 50% plays it at half speed.")
+        tempo_slider, self.tempo_spinbox = self._create_slider_and_spinbox(10.0, 200.0, 100.0, "%", factor=10.0, decimals=1)
         grid.addWidget(tempo_label, 0, 0); grid.addWidget(tempo_info, 0, 1)
-        grid.addWidget(self.tempo_slider, 0, 2); grid.addWidget(self.tempo_spinbox, 0, 3)
+        grid.addWidget(tempo_slider, 0, 2); grid.addWidget(self.tempo_spinbox, 0, 3)
 
         # Row 1: Pedal Style
-        pedal_label = QLabel("Pedal Style")
-        pedal_info = self._create_info_icon("Changes how the sustain pedal (spacebar) is used automatically.\nHybrid: Balances connection and clarity between notes.\nLegato: Smoothly connects all notes.\nRhythmic: Follows the rhythm and main beats.\nNone: No pedal.")
+        pedal_label = QLabel("Pedal Style:")
+        pedal_info = self._create_info_icon("Controls how the sustain pedal (spacebar) is automatically used.\n\n- Hybrid: Balances clarity and connection (recommended).\n- Legato: Connects notes smoothly, ideal for lyrical music.\n- Rhythmic: Emphasizes rhythmic patterns by pedaling on accented notes.\n- None: Disables automatic pedaling.")
         self.pedal_style_combo = QComboBox()
         self.pedal_style_combo.addItems(['hybrid', 'legato', 'rhythmic', 'none'])
         grid.addWidget(pedal_label, 1, 0); grid.addWidget(pedal_info, 1, 1)
@@ -1230,10 +1215,11 @@ class MainWindow(QMainWindow):
 
         # Row 2: 88-Key Layout
         self.use_88_key_check = QCheckBox("Use 88-Key Extended Layout")
+        self.use_88_key_check.setToolTip("Expands the keyboard mapping to cover a full 88-key piano range.\nThis disables automatic octave transposition and uses 'Ctrl + key' for the lowest and highest octaves.")
         grid.addWidget(self.use_88_key_check, 2, 0, 1, 4)
 
         # Row 3 & 4: Other Checkboxes
-        self.countdown_check = QCheckBox("3 second countdown")
+        self.countdown_check = QCheckBox("Enable 3-second countdown")
         self.debug_check = QCheckBox("Enable debug output")
         grid.addWidget(self.countdown_check, 3, 0, 1, 4)
         grid.addWidget(self.debug_check, 4, 0, 1, 4)
@@ -1243,117 +1229,79 @@ class MainWindow(QMainWindow):
         return group
 
     def _create_humanization_group(self):
-        group = QGroupBox("Humanization")
-        main_v_layout = QVBoxLayout(group)
+        group = QGroupBox("Humanization Controls")
+        grid = QGridLayout(group)
+        self.humanization_sub_checkboxes.clear(); self.humanization_sliders.clear(); self.humanization_spinboxes.clear()
 
         self.select_all_humanization_check = QCheckBox("Select/Deselect All")
         self.select_all_humanization_check.setStyleSheet("font-weight: bold;")
-        main_v_layout.addWidget(self.select_all_humanization_check)
+        grid.addWidget(self.select_all_humanization_check, 0, 0, 1, 4)
         
-        # --- Store all controls for easier management ---
-        self.all_humanization_checks = {}
-        self.all_humanization_spinboxes = {}
-        self.all_humanization_sliders = {}
+        # --- Simulate Hands Checkbox ---
+        self.simulate_hands_check = QCheckBox("Simulate hands")
+        self.simulate_hands_check.setToolTip("Use this for solo piano pieces. A sophisticated algorithm will attempt to assign notes\nto the left and right hands, simulating a human player. If unchecked, a simple pitch split is used.")
+        info_hands = self._create_info_icon("Limits to 10 notes at once (5 per hand).")
+        grid.addWidget(self.simulate_hands_check, 1, 0)
+        grid.addWidget(info_hands, 1, 1)
+        self.humanization_sub_checkboxes.append(self.simulate_hands_check)
 
-        # --- Simple Toggles ---
-        simple_toggles_layout = QHBoxLayout()
-        self.all_humanization_checks['simulate_hands'] = QCheckBox("Simulate Hands")
-        self.all_humanization_checks['vary_velocity'] = QCheckBox("Vary Velocity")
-        self.all_humanization_checks['enable_chord_roll'] = QCheckBox("Chord Rolling")
-        
-        simple_toggles_layout.addWidget(self.all_humanization_checks['simulate_hands'])
-        simple_toggles_layout.addWidget(self._create_info_icon("Simulates two separate hands playing using a cost-based algorithm. If off, hands are split simply by high/low notes."))
-        simple_toggles_layout.addStretch(1)
-        simple_toggles_layout.addWidget(self.all_humanization_checks['vary_velocity'])
-        simple_toggles_layout.addWidget(self._create_info_icon("Randomly adjusts the velocity (how 'hard' a key is pressed) for each note."))
-        simple_toggles_layout.addStretch(1)
-        simple_toggles_layout.addWidget(self.all_humanization_checks['enable_chord_roll'])
-        simple_toggles_layout.addWidget(self._create_info_icon("Plays chords by quickly 'rolling' the notes from bottom to top, instead of hitting them all at once."))
-        
-        main_v_layout.addLayout(simple_toggles_layout)
-        
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        main_v_layout.addWidget(line)
 
-        # --- Detailed Adjustments ---
-        detailed_layout = QGridLayout()
-        detailed_layout.setColumnStretch(2, 1) # Make slider column stretchable
-        
-        def add_detailed_row(row_idx, name, key, tip, min_val, max_val, def_val, suffix, factor=1.0, decimals=3):
-            check = QCheckBox(name)
-            info = self._create_info_icon(tip)
+        def add_humanization_row(row_idx, label, tip, min_val, max_val, def_val, suffix, factor=1.0, decimals=3):
+            check = QCheckBox(label); info = self._create_info_icon(tip)
             slider, spinbox = self._create_slider_and_spinbox(min_val, max_val, def_val, suffix, factor=factor, decimals=decimals)
-            
-            check.toggled.connect(slider.setEnabled)
-            check.toggled.connect(spinbox.setEnabled)
-            
-            detailed_layout.addWidget(check, row_idx, 0)
-            detailed_layout.addWidget(info, row_idx, 1)
-            detailed_layout.addWidget(slider, row_idx, 2)
-            detailed_layout.addWidget(spinbox, row_idx, 3)
+            grid.addWidget(check, row_idx, 0); grid.addWidget(info, row_idx, 1);
+            grid.addWidget(slider, row_idx, 2); grid.addWidget(spinbox, row_idx, 3)
+            check.toggled.connect(slider.setEnabled); check.toggled.connect(spinbox.setEnabled)
+            self.humanization_sub_checkboxes.append(check); self.humanization_sliders.append(slider); self.humanization_spinboxes.append(spinbox)
+            return check, spinbox
 
-            self.all_humanization_checks[key] = check
-            self.all_humanization_sliders[key] = slider
-            self.all_humanization_spinboxes[key] = spinbox
+        add_humanization_row(2, "Timing Variance:", "Randomly alters note start times to simulate human timing imperfections.\nExample: A value of 0.010s (10ms) means notes can play up to 10ms earlier or later than written.", 0, 0.1, 0.01, " s", factor=10000.0)
+        add_humanization_row(3, "Base Articulation:", "Sets the base length of every note as a percentage of its original duration.\nExample: 95% creates a slightly detached (staccato) feel, while 100% is fully connected (legato).", 50, 100, 95, "%", factor=100.0, decimals=1)
+        add_humanization_row(4, "Hand Drift Decay:", "Simulates the natural timing drift between left and right hands.\nThis value controls how quickly the hands 're-sync' at musical phrase boundaries.\nHigher values mean faster re-synchronization.", 0, 100, 25, "%", factor=100.0, decimals=1)
+        add_humanization_row(5, "Mistake Chance:", "Gives a percentage chance for a note to be 'mispressed' (a nearby note is played for a very\nshort duration) before the correct note sounds, simulating an accidental finger slip.", 0, 10, 0, "%", factor=100.0, decimals=1)
+        add_humanization_row(6, "Tempo Sway:", "Simulates expressive tempo changes (rubato) over musical phrases.\nThis value is the maximum time shift in seconds. The actual sway is randomized per phrase\nand is amplified in slow sections and reduced in fast sections.", 0, 0.1, 0, " s", factor=10000.0)
 
-        add_detailed_row(0, "Vary Timing", "vary_timing", "Randomly shifts the start time of each note. The value sets the maximum amount of the shift, earlier or later.", 0, 0.1, 0.01, " s", factor=10000.0)
-        add_detailed_row(1, "Vary Articulation", "vary_articulation", "Changes the length of every note. 100% is fully connected, while lower values like 95% make notes more detached.", 50, 100, 95, "%", factor=100.0, decimals=1)
-        add_detailed_row(2, "Hand Drift", "hand_drift", "Simulates hands going slightly out of sync, then re-syncing. Higher values make them re-sync faster at the start of new phrases.", 0, 100, 25, "%", factor=100.0, decimals=1)
-        add_detailed_row(3, "Mistake Chance", "mistake_chance", "Gives each note a percentage chance to be 'misplayed' by briefly hitting a nearby key before the correct one.", 0, 10, 0, "%", factor=100.0, decimals=1)
-        add_detailed_row(4, "Tempo Sway", "tempo_sway", "Applies expressive tempo changes over musical phrases.\nNormal: Slows down in sparse sections and speeds up in dense sections.\nInverted: Reverses the behavior, slowing down in dense sections.", 0, 0.1, 0, " s", factor=10000.0)
+        self.vary_velocity_check = QCheckBox("Vary note velocity")
+        velocity_info = self._create_info_icon("Randomly adjusts the velocity (how 'hard' a key is pressed) of each note, making the performance sound more dynamic and less robotic.")
+        grid.addWidget(self.vary_velocity_check, 7, 0); grid.addWidget(velocity_info, 7, 1)
+        self.humanization_sub_checkboxes.append(self.vary_velocity_check)
 
-        # Add Invert Tempo Sway checkbox in its own row
-        self.invert_sway_check = QCheckBox("Invert tempo sway")
-        self.all_humanization_checks['invert_tempo_sway'] = self.invert_sway_check
-        self.all_humanization_checks['tempo_sway'].toggled.connect(self.invert_sway_check.setEnabled)
-        detailed_layout.addWidget(self.invert_sway_check, 5, 0)
+        self.enable_chord_roll_check = QCheckBox("Enable chord rolling")
+        roll_info = self._create_info_icon("Simulates the 'rolling' of chords, where the notes are played in very quick succession from bottom to top instead of at the exact same moment.")
+        grid.addWidget(self.enable_chord_roll_check, 8, 0); grid.addWidget(roll_info, 8, 1)
+        self.humanization_sub_checkboxes.append(self.enable_chord_roll_check)
 
-        main_v_layout.addLayout(detailed_layout)
-        
+        grid.setColumnStretch(2, 1)
         self.select_all_humanization_check.toggled.connect(self._toggle_all_humanization)
-        for check in self.all_humanization_checks.values():
-            check.toggled.connect(self._update_select_all_state)
-            
+        for checkbox in self.humanization_sub_checkboxes: checkbox.toggled.connect(self._update_select_all_state)
         self._reset_humanization_group_to_default()
         return group
 
-
     def _reset_controls_to_default(self):
-        self.add_log_message("All settings have been reset to their default values.")
         self._reset_playback_group_to_default()
         self._reset_humanization_group_to_default()
+        self.add_log_message("All settings have been reset to their default values.")
 
     def _reset_playback_group_to_default(self):
-        self.tempo_spinbox.setValue(100)
-        self.pedal_style_combo.setCurrentText('hybrid')
+        self.tempo_spinbox.setValue(100); self.pedal_style_combo.setCurrentText('hybrid')
         self.use_88_key_check.setChecked(False)
         self.countdown_check.setChecked(True)
         self.debug_check.setChecked(False)
 
     def _reset_humanization_group_to_default(self):
-        # Set values
-        self.all_humanization_spinboxes['vary_timing'].setValue(0.010)
-        self.all_humanization_spinboxes['vary_articulation'].setValue(95.0)
-        self.all_humanization_spinboxes['hand_drift'].setValue(25.0)
-        self.all_humanization_spinboxes['mistake_chance'].setValue(0.5)
-        self.all_humanization_spinboxes['tempo_sway'].setValue(0.015)
-        
-        # Set checkbox states to False
-        for check in self.all_humanization_checks.values():
-            check.setChecked(False)
-            
-        # Manually update enabled state of child controls
-        self._update_enabled_states()
-
+        self.simulate_hands_check.setChecked(False)
+        self.humanization_spinboxes[0].setValue(0.010)
+        self.humanization_spinboxes[1].setValue(95.0)
+        self.humanization_spinboxes[2].setValue(25.0)
+        self.humanization_spinboxes[3].setValue(0.0)
+        self.humanization_spinboxes[4].setValue(0.0)
+        self.select_all_humanization_check.setChecked(False)
 
     def _toggle_all_humanization(self, checked):
-        for check in self.all_humanization_checks.values():
-            check.setChecked(checked)
+        for checkbox in self.humanization_sub_checkboxes: checkbox.setChecked(checked)
 
     def _update_select_all_state(self):
-        is_all_checked = all(c.isChecked() for c in self.all_humanization_checks.values())
+        is_all_checked = all(c.isChecked() for c in self.humanization_sub_checkboxes)
         self.select_all_humanization_check.blockSignals(True)
         self.select_all_humanization_check.setChecked(is_all_checked)
         self.select_all_humanization_check.blockSignals(False)
@@ -1382,127 +1330,30 @@ class MainWindow(QMainWindow):
         self.reset_button.setEnabled(enabled)
         for groupbox in self.findChildren(QGroupBox): groupbox.setEnabled(enabled)
 
-    def _save_config(self):
-        config = {
-            # Playback
-            'tempo': self.tempo_spinbox.value(),
-            'pedal_style': self.pedal_style_combo.currentText(),
-            'use_88_key_layout': self.use_88_key_check.isChecked(),
-            'countdown': self.countdown_check.isChecked(),
-            'debug_mode': self.debug_check.isChecked(),
-            # Humanization
-            'select_all_humanization': self.select_all_humanization_check.isChecked(),
-            'simulate_hands': self.all_humanization_checks['simulate_hands'].isChecked(),
-            'vary_velocity': self.all_humanization_checks['vary_velocity'].isChecked(),
-            'enable_chord_roll': self.all_humanization_checks['enable_chord_roll'].isChecked(),
-            'enable_vary_timing': self.all_humanization_checks['vary_timing'].isChecked(), 
-            'value_timing_variance': self.all_humanization_spinboxes['vary_timing'].value(),
-            'enable_vary_articulation': self.all_humanization_checks['vary_articulation'].isChecked(), 
-            'value_articulation': self.all_humanization_spinboxes['vary_articulation'].value(),
-            'enable_hand_drift': self.all_humanization_checks['hand_drift'].isChecked(), 
-            'value_hand_drift_decay': self.all_humanization_spinboxes['hand_drift'].value(),
-            'enable_mistakes': self.all_humanization_checks['mistake_chance'].isChecked(), 
-            'value_mistake_chance': self.all_humanization_spinboxes['mistake_chance'].value(),
-            'enable_tempo_sway': self.all_humanization_checks['tempo_sway'].isChecked(), 
-            'value_tempo_sway_intensity': self.all_humanization_spinboxes['tempo_sway'].value(),
-            'invert_tempo_sway': self.all_humanization_checks['invert_tempo_sway'].isChecked(),
-        }
-        try:
-            with open(self.config_path, 'w') as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            print(f"Error saving config: {e}")
-
-    def _update_enabled_states(self):
-        """Manually update the enabled state of child widgets based on parent checkboxes."""
-        for key, check in self.all_humanization_checks.items():
-            is_checked = check.isChecked()
-            if key in self.all_humanization_sliders:
-                self.all_humanization_sliders[key].setEnabled(is_checked)
-            if key in self.all_humanization_spinboxes:
-                self.all_humanization_spinboxes[key].setEnabled(is_checked)
-        
-        self.invert_sway_check.setEnabled(self.all_humanization_checks['tempo_sway'].isChecked())
-
-
-    def _load_config(self):
-        if not self.config_path.exists():
-            self.add_log_message("No config file found. Using default settings.")
-            self._update_enabled_states() # Ensure initial gray-out state is correct
-            return
-        
-        try:
-            with open(self.config_path, 'r') as f:
-                config = json.load(f)
-
-            self.tempo_spinbox.setValue(config.get('tempo', 100.0))
-            self.pedal_style_combo.setCurrentText(config.get('pedal_style', 'hybrid'))
-            self.use_88_key_check.setChecked(config.get('use_88_key_layout', False))
-            self.countdown_check.setChecked(config.get('countdown', True))
-            self.debug_check.setChecked(config.get('debug_mode', False))
-            self.select_all_humanization_check.setChecked(config.get('select_all_humanization', False))
-            
-            self.all_humanization_checks['simulate_hands'].setChecked(config.get('simulate_hands', False))
-            self.all_humanization_checks['vary_velocity'].setChecked(config.get('vary_velocity', False))
-            self.all_humanization_checks['enable_chord_roll'].setChecked(config.get('enable_chord_roll', False))
-            
-            self.all_humanization_checks['vary_timing'].setChecked(config.get('enable_vary_timing', False))
-            self.all_humanization_spinboxes['vary_timing'].setValue(config.get('value_timing_variance', 0.010))
-            self.all_humanization_checks['vary_articulation'].setChecked(config.get('enable_vary_articulation', False))
-            self.all_humanization_spinboxes['vary_articulation'].setValue(config.get('value_articulation', 95.0))
-            self.all_humanization_checks['hand_drift'].setChecked(config.get('enable_hand_drift', False))
-            self.all_humanization_spinboxes['hand_drift'].setValue(config.get('value_hand_drift_decay', 25.0))
-            self.all_humanization_checks['mistake_chance'].setChecked(config.get('enable_mistakes', False))
-            self.all_humanization_spinboxes['mistake_chance'].setValue(config.get('value_mistake_chance', 0.5))
-            self.all_humanization_checks['tempo_sway'].setChecked(config.get('enable_tempo_sway', False))
-            self.all_humanization_spinboxes['tempo_sway'].setValue(config.get('value_tempo_sway_intensity', 0.015))
-            self.all_humanization_checks['invert_tempo_sway'].setChecked(config.get('invert_tempo_sway', False))
-            
-            self.add_log_message(f"Configuration loaded from {self.config_path}")
-
-        except Exception as e:
-            self.add_log_message(f"Error loading config file: {e}. Using defaults.")
-            self._reset_controls_to_default()
-        finally:
-            self._update_enabled_states()
-
-
     def gather_config(self) -> Optional[Dict[str, Any]]:
         filepath = self.file_path_label.toolTip()
         if not filepath:
             QMessageBox.warning(self, "No File", "Please select a MIDI file before playing."); return None
         return {
-            'midi_file': filepath, 
-            'tempo': self.tempo_spinbox.value(), 
-            'countdown': self.countdown_check.isChecked(),
+            'midi_file': filepath, 'tempo': self.tempo_spinbox.value(), 'countdown': self.countdown_check.isChecked(),
             'use_88_key_layout': self.use_88_key_check.isChecked(),
             'pedal_style': self.pedal_style_combo.currentText(),
             'debug_mode': self.debug_check.isChecked(),
             # Humanization
-            'simulate_hands': self.all_humanization_checks['simulate_hands'].isChecked(),
-            'vary_velocity': self.all_humanization_checks['vary_velocity'].isChecked(),
-            'enable_chord_roll': self.all_humanization_checks['enable_chord_roll'].isChecked(),
-            'vary_timing': self.all_humanization_checks['vary_timing'].isChecked(), 
-            'timing_variance': self.all_humanization_spinboxes['vary_timing'].value(),
-            'vary_articulation': self.all_humanization_checks['vary_articulation'].isChecked(), 
-            'articulation': self.all_humanization_spinboxes['vary_articulation'].value() / 100.0,
-            'enable_drift_correction': self.all_humanization_checks['hand_drift'].isChecked(), 
-            'drift_decay_factor': self.all_humanization_spinboxes['hand_drift'].value() / 100.0,
-            'enable_mistakes': self.all_humanization_checks['mistake_chance'].isChecked(), 
-            'mistake_chance': self.all_humanization_spinboxes['mistake_chance'].value(),
-            'enable_tempo_sway': self.all_humanization_checks['tempo_sway'].isChecked(), 
-            'tempo_sway_intensity': self.all_humanization_spinboxes['tempo_sway'].value(),
-            'invert_tempo_sway': self.all_humanization_checks['invert_tempo_sway'].isChecked(),
+            'simulate_hands': self.humanization_sub_checkboxes[0].isChecked(),
+            'vary_timing': self.humanization_sub_checkboxes[1].isChecked(), 'timing_variance': self.humanization_spinboxes[0].value(),
+            'vary_articulation': self.humanization_sub_checkboxes[2].isChecked(), 'articulation': self.humanization_spinboxes[1].value() / 100.0,
+            'enable_drift_correction': self.humanization_sub_checkboxes[3].isChecked(), 'drift_decay_factor': self.humanization_spinboxes[2].value() / 100.0,
+            'enable_mistakes': self.humanization_sub_checkboxes[4].isChecked(), 'mistake_chance': self.humanization_spinboxes[3].value(),
+            'enable_tempo_sway': self.humanization_sub_checkboxes[5].isChecked(), 'tempo_sway_intensity': self.humanization_spinboxes[4].value(),
+            'vary_velocity': self.humanization_sub_checkboxes[6].isChecked(),
+            'enable_chord_roll': self.humanization_sub_checkboxes[7].isChecked(),
         }
 
     def handle_play(self):
         if self.player_thread and self.player_thread.isRunning(): return
         config = self.gather_config()
         if not config: return
-        
-        self._save_config()
-        self.add_log_message("Configuration saved.")
-
         self.set_controls_enabled(False)
         self.progress_bar.setValue(0)
         self.add_log_message("="*50 + f"\nStarting playback...")
