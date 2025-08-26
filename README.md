@@ -1,5 +1,5 @@
 # MIDI2Key, a human-like autoplayer for ROBLOX
-MIDI2Key is a Python-based tool that converts MIDI files into keystrokes for ROBLOX piano simulations. It includes humanization effects, automated pedal support, 88-key support and multiple playback modes for realistic, human-like playbacks. Easy to run via executable or source code, with GUI support included.
+MIDI2Key includes various humanization options for a natural, human-like playback. Including automatic pedal timing and 88-key keyboard support. Easy to run via executable or source code, with GUI support included.
 
 
 <img width="326" height="396" alt="MIDI2Key application screenshot" src="https://github.com/user-attachments/assets/1217313a-13fb-4ea8-b753-2d70ea486af9" />
