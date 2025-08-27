@@ -1,4 +1,5 @@
-# MIDI2Key, a human-like autoplayer for ROBLOX
+# Midi2Key
+
 MIDI2Key includes various humanization options for a natural, human-like playback. Including automatic pedal timing and 88-key keyboard support. Easy to run via executable or source code, with GUI support included.
 
 
